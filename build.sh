@@ -6,7 +6,6 @@ DIST="$ROOT/dist"
 WORK="$ROOT/.build"
 APP="$DIST/SSTP Client GUI.app"
 BIN="$APP/Contents/MacOS/SSTPClientGUI"
-SRC="$ROOT/Sources/SSTPClientGUI.swift"
 RES="$ROOT/Resources"
 TOOLS="$ROOT/Tools"
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
@@ -87,6 +86,7 @@ install_app() {
   /usr/bin/codesign --verify --deep --strict --verbose=2 "$target"
 
   echo "Installed version: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$target/Contents/Info.plist")"
+  echo "Installed build: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$target/Contents/Info.plist")"
   echo "Installed architectures: $(/usr/bin/lipo -archs "$target/Contents/MacOS/SSTPClientGUI")"
 
   if [ "$OPEN_APP" -eq 1 ]; then
@@ -103,8 +103,6 @@ fi
 
 BUILD_IN_PROGRESS=1
 
-# Always start from a clean local build. This also removes a partial .app left by
-# an interrupted/failed older build.
 rm -rf "$DIST" "$WORK"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$WORK"
 
@@ -116,17 +114,16 @@ fi
 
 SDK="$(xcrun --sdk macosx --show-sdk-path)"
 SWIFTC="$(xcrun --find swiftc)"
+SOURCES=("$ROOT"/Sources/*.swift)
 
 echo "SDK: $SDK"
 echo "Swift compiler: $SWIFTC"
+echo "Swift sources: ${#SOURCES[@]}"
 
 cp "$RES/vpnctl.sh" "$APP/Contents/Resources/vpnctl.sh"
 cp "$RES/setup.sh" "$APP/Contents/Resources/setup.sh"
 chmod 755 "$APP/Contents/Resources/vpnctl.sh" "$APP/Contents/Resources/setup.sh"
 
-# Build the icon generator as a normal executable. Using `xcrun swift` here can
-# fail on Command Line Tools installations because the Swift JIT does not link
-# AppKit symbols (_NSImage, _NSColor, ...).
 echo "Generating app icon..."
 ICON_TOOL="$WORK/make_icon"
 "$SWIFTC" \
@@ -157,40 +154,42 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
   <key>CFBundleVersion</key>
-  <string>5</string>
+  <string>6</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.2.2</string>
+  <string>1.3.0</string>
   <key>LSMinimumSystemVersion</key>
   <string>12.0</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.utilities</string>
   <key>NSHighResolutionCapable</key>
   <true/>
 </dict>
 </plist>
 PLIST
 
+COMMON_ARGS=(
+  -parse-as-library
+  -swift-version 5
+  -sdk "$SDK"
+  -framework SwiftUI
+  -framework AppKit
+  -framework Security
+  -framework UserNotifications
+)
+
 echo "Building arm64..."
 "$SWIFTC" \
-  -parse-as-library \
-  -swift-version 5 \
+  "${COMMON_ARGS[@]}" \
   -target arm64-apple-macos12.0 \
-  -sdk "$SDK" \
-  "$SRC" \
-  -o "$WORK/SSTPClientGUI-arm64" \
-  -framework SwiftUI \
-  -framework AppKit \
-  -framework Security
+  "${SOURCES[@]}" \
+  -o "$WORK/SSTPClientGUI-arm64"
 
 echo "Building x86_64..."
 "$SWIFTC" \
-  -parse-as-library \
-  -swift-version 5 \
+  "${COMMON_ARGS[@]}" \
   -target x86_64-apple-macos12.0 \
-  -sdk "$SDK" \
-  "$SRC" \
-  -o "$WORK/SSTPClientGUI-x86_64" \
-  -framework SwiftUI \
-  -framework AppKit \
-  -framework Security
+  "${SOURCES[@]}" \
+  -o "$WORK/SSTPClientGUI-x86_64"
 
 /usr/bin/lipo -create \
   "$WORK/SSTPClientGUI-arm64" \
@@ -207,6 +206,7 @@ echo "Signing with: $SIGN_IDENTITY"
 
 echo "Architectures: $(/usr/bin/lipo -archs "$BIN")"
 echo "Version: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+echo "Build: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Contents/Info.plist")"
 
 /usr/bin/ditto -c -k --sequesterRsrc --keepParent \
   "$APP" \
