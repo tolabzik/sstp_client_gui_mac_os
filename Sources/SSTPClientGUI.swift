@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Security
 import Darwin
+import UniformTypeIdentifiers
 
 // MARK: - Keychain
 
@@ -42,6 +43,8 @@ enum VPNStatus: Equatable {
     case disconnected, connecting, connected, error
 }
 
+// MARK: - VPN model
+
 final class VPNModel: ObservableObject {
     @Published var server = ""
     @Published var username = ""
@@ -73,6 +76,7 @@ final class VPNModel: ObservableObject {
     private let pidFile = "/tmp/sstp-gui.pid"
     private let stateFile = "/tmp/sstp-gui.state"
     private let logFile = "/tmp/sstp-gui.log"
+    private let watchdogLogFile = "/tmp/sstp-gui-watchdog.log"
     private var timer: Timer?
 
     init() {
@@ -240,7 +244,7 @@ final class VPNModel: ObservableObject {
                     if fullTunnel {
                         if routeInterface("1.1.1.1") == ppp {
                             status = .connected
-                            message = "Full tunnel active via \(ppp)"
+                            message = "Full Tunnel active via \(ppp)"
                             return
                         }
                     } else {
@@ -251,16 +255,19 @@ final class VPNModel: ObservableObject {
                 }
             }
         }
+
         if processAlive() {
             status = .connecting
             message = "SSTP/PPP is starting and routes are being checked"
             return
         }
+
         if result.hasPrefix("FAIL|") {
             status = .error
             message = String(result.dropFirst(5))
             return
         }
+
         if status != .error {
             status = .disconnected
             message = ""
@@ -314,7 +321,7 @@ final class VPNModel: ObservableObject {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        panel.allowedFileTypes = ["crt", "pem", "cer"]
+        panel.allowedContentTypes = ["crt", "pem", "cer"].compactMap { UTType(filenameExtension: $0) }
         if panel.runModal() == .OK, let url = panel.url {
             certificatePath = url.path
             savePreferences()
@@ -344,7 +351,7 @@ final class VPNModel: ObservableObject {
         let certMode = ignoreCertificate ? "ignore" : "verify"
         let command = "/bin/bash \(shellQuote(controller)) connect \(shellQuote(server)) \(shellQuote(username)) \(shellQuote(secret)) \(shellQuote(certMode)) \(shellQuote(certificatePath)) \(fullTunnel ? "1" : "0")"
         status = .connecting
-        message = fullTunnel ? "Connecting; full tunnel will only be enabled after a PPP connectivity test" : "Connecting SSTP"
+        message = fullTunnel ? "Connecting; Full Tunnel will be enabled only after the PPP connectivity test" : "Connecting SSTP"
 
         runAdminAsync(command) { error in
             if let error {
@@ -362,7 +369,7 @@ final class VPNModel: ObservableObject {
         guard let controller = controllerPath else { return }
         let command = "/bin/bash \(shellQuote(controller)) disconnect \(shellQuote(server))"
         status = .connecting
-        message = "Disconnecting..."
+        message = "Disconnecting…"
         runAdminAsync(command) { error in
             if let error { self.status = .error; self.message = error }
             else { self.status = .disconnected; self.message = "" }
@@ -375,7 +382,7 @@ final class VPNModel: ObservableObject {
         guard let controller = controllerPath else { return }
         let command = "/bin/bash \(shellQuote(controller)) repair \(shellQuote(server))"
         status = .connecting
-        message = "Removing SSTP GUI routes and owned process..."
+        message = "Removing SSTP GUI routes and owned processes…"
         runAdminAsync(command) { error in
             if let error { self.status = .error; self.message = error }
             else { self.status = .disconnected; self.message = "Network state cleaned" }
@@ -403,7 +410,7 @@ final class VPNModel: ObservableObject {
 
     func runDiagnostics() {
         diagnosticsRunning = true
-        diagnostics = "Running extended diagnostics..."
+        diagnostics = "Running extended diagnostics…"
         savePreferences()
 
         let serverCopy = server.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -411,6 +418,8 @@ final class VPNModel: ObservableObject {
         let targetCopy = requestedTarget.isEmpty ? serverCopy : requestedTarget
         let parsedPort = Int(diagnosticPort.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 443
         let portCopy = (1...65535).contains(parsedPort) ? parsedPort : 443
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
 
         DispatchQueue.global(qos: .userInitiated).async {
             var out = ""
@@ -430,6 +439,7 @@ final class VPNModel: ObservableObject {
                 appendCommand("/usr/sbin/traceroute", ["-n", "-m", "12", "-w", "1", "-q", "1", host])
             }
 
+            section("SSTP CLIENT GUI"); out += "Version: \(version)\nBuild: \(build)\nRepository: \(AppLinks.repository)\n"
             section("DATE"); appendCommand("/bin/date", [])
             section("MACOS"); appendCommand("/usr/bin/sw_vers", [])
             section("ARCH"); appendCommand("/usr/bin/uname", ["-m"])
@@ -440,6 +450,7 @@ final class VPNModel: ObservableObject {
             section("SSTP"); out += self.sstpcPath().map { self.run($0, ["--version"]) + "\nPath: \($0)\n" } ?? "NOT INSTALLED\n"
             section("PPPD"); out += self.runShell("ls -l /usr/sbin/pppd /etc/ppp/options 2>&1")
             section("VPN PROCESS"); out += self.runShell("if [ -f /tmp/sstp-gui.pid ]; then PID=$(cat /tmp/sstp-gui.pid); ps -p \"$PID\" -o pid,ppid,user,etime,comm; else echo NONE; fi")
+            section("WATCHDOG"); out += self.runShell("if [ -f /tmp/sstp-gui-watchdog.pid ]; then echo PID=$(cat /tmp/sstp-gui-watchdog.pid); ps -p $(cat /tmp/sstp-gui-watchdog.pid) -o pid,ppid,user,etime,comm 2>/dev/null || true; else echo NONE; fi; tail -n 30 /tmp/sstp-gui-watchdog.log 2>/dev/null || true")
             section("PPP INTERFACES"); out += self.runShell("/sbin/ifconfig | grep -A 12 '^ppp' || true")
             section("VPN CONFLICT CHECK")
             out += self.runShell("echo 'PPP:'; /sbin/ifconfig -l | tr ' ' '\\n' | grep '^ppp[0-9]' || true; echo 'Split-default routes:'; /usr/sbin/netstat -rn -f inet | awk '$1==\"0/1\" || $1==\"0.0.0.0/1\" || $1==\"128.0/1\" || $1==\"128.0.0.0/1\" {print}'; echo 'Default path:'; /sbin/route -n get 1.1.1.1 2>&1 | grep -E 'gateway:|interface:'")
@@ -472,7 +483,7 @@ final class VPNModel: ObservableObject {
             section("DNS"); out += self.runShell("/usr/sbin/scutil --dns | head -n 160")
             section("APP RESULT"); out += self.runShell("cat /tmp/sstp-gui.result 2>/dev/null || echo NONE")
             section("APP STATE"); out += self.runShell("cat /tmp/sstp-gui.state 2>/dev/null || echo NONE")
-            section("VPN LOG"); out += self.runShell("tail -n 80 /tmp/sstp-gui.log 2>/dev/null || echo 'No log'")
+            section("VPN LOG"); out += self.runShell("tail -n 100 /tmp/sstp-gui.log 2>/dev/null || echo 'No log'")
 
             DispatchQueue.main.async {
                 self.diagnostics = out
@@ -492,9 +503,15 @@ final class VPNModel: ObservableObject {
             NSWorkspace.shared.open(URL(fileURLWithPath: logFile))
         }
     }
+
+    func openWatchdogLog() {
+        if FileManager.default.fileExists(atPath: watchdogLogFile) {
+            NSWorkspace.shared.open(URL(fileURLWithPath: watchdogLogFile))
+        }
+    }
 }
 
-// MARK: - UI Components
+// MARK: - UI components
 
 struct AppCard<Content: View>: View {
     let content: Content
@@ -505,8 +522,12 @@ struct AppCard<Content: View>: View {
             .padding(18)
             .background(
                 RoundedRectangle(cornerRadius: 18)
-                    .fill(Color(nsColor: .controlBackgroundColor).opacity(0.92))
-                    .shadow(color: Color.black.opacity(0.08), radius: 14, x: 0, y: 6)
+                    .fill(Color(nsColor: .controlBackgroundColor).opacity(0.94))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 18)
+                            .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+                    )
+                    .shadow(color: Color.black.opacity(0.07), radius: 14, x: 0, y: 6)
             )
     }
 }
@@ -569,12 +590,32 @@ struct StatusPill: View {
     }
 }
 
+struct AppFooter: View {
+    @ObservedObject var updater: UpdateManager
+
+    var body: some View {
+        HStack {
+            Text("SSTP Client GUI v\(updater.currentVersion) · build \(updater.currentBuild)")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            Spacer()
+            Button("GitHub") { updater.openGitHub() }
+                .buttonStyle(.link)
+        }
+    }
+}
+
+// MARK: - Main UI
+
 struct ContentView: View {
     @StateObject private var vpn = VPNModel()
+    @StateObject private var profiles = VPNProfileStore()
+    @StateObject private var updater = UpdateManager()
+    @StateObject private var statusBar = StatusBarController()
 
     private var background: some View {
         LinearGradient(
-            colors: [Color.blue.opacity(0.08), Color.cyan.opacity(0.05), Color.clear],
+            colors: [Color.blue.opacity(0.09), Color.cyan.opacity(0.045), Color.clear],
             startPoint: .topLeading,
             endPoint: .bottomTrailing
         ).ignoresSafeArea()
@@ -586,7 +627,30 @@ struct ContentView: View {
                 background
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
-                        AppHeader(title: "SSTP Client GUI", subtitle: "Secure PPP tunnel for macOS", icon: "lock.shield.fill")
+                        HStack {
+                            AppHeader(title: "SSTP Client GUI", subtitle: "Secure SSTP / PPP tunnel for macOS", icon: "lock.shield.fill")
+                            StatusPill(color: .blue, text: "v\(updater.currentVersion)")
+                        }
+
+                        if updater.updateAvailable {
+                            AppCard {
+                                HStack(spacing: 12) {
+                                    Image(systemName: "arrow.down.circle.fill")
+                                        .font(.title2)
+                                        .foregroundColor(.orange)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("Update v\(updater.latestVersion) is available").fontWeight(.semibold)
+                                        Text("The update can be downloaded, SHA-256 verified and installed from GitHub Releases.")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                    Button(updater.installing ? "Installing…" : "Install update") { updater.installUpdate() }
+                                        .buttonStyle(.borderedProminent)
+                                        .disabled(updater.installing)
+                                }
+                            }
+                        }
 
                         AppCard {
                             HStack {
@@ -601,6 +665,8 @@ struct ContentView: View {
                                 StatusPill(color: vpn.statusColor, text: vpn.statusText)
                             }
                         }
+
+                        ProfilesPanel(store: profiles, vpn: vpn)
 
                         AppCard {
                             VStack(alignment: .leading, spacing: 13) {
@@ -638,6 +704,9 @@ struct ContentView: View {
                                         Button("Choose certificate") { vpn.chooseCertificate() }
                                     }
                                 }
+                                Text("The root watchdog restores this app's Full Tunnel routes if sstpc exits unexpectedly.")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
                             }
                         }
 
@@ -653,10 +722,12 @@ struct ContentView: View {
                                     .controlSize(.large)
                                     .disabled(!vpn.ready || vpn.status == .connecting)
                             }
-                            Button("Open log") { vpn.openLog() }
-                                .controlSize(.large)
+                            Button("Open VPN log") { vpn.openLog() }.controlSize(.large)
+                            Button("Watchdog log") { vpn.openWatchdogLog() }.controlSize(.large)
                             Spacer()
                         }
+
+                        AppFooter(updater: updater)
                     }
                     .padding(24)
                 }
@@ -667,7 +738,7 @@ struct ContentView: View {
                 background
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
-                        AppHeader(title: "Setup", subtitle: "Dependencies and network health", icon: "gearshape.2.fill")
+                        AppHeader(title: "Setup & Health", subtitle: "Dependencies, routes and live network checks", icon: "gearshape.2.fill")
 
                         AppCard {
                             VStack(alignment: .leading, spacing: 13) {
@@ -683,6 +754,8 @@ struct ContentView: View {
                             }
                         }
 
+                        NetworkHealthPanel(vpn: vpn)
+
                         AppCard {
                             VStack(alignment: .leading, spacing: 10) {
                                 HStack {
@@ -696,7 +769,7 @@ struct ContentView: View {
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                                     .textSelection(.enabled)
-                                Text("The app detects foreign PPP default paths and stale 0/1 + 128/1 routes. It does not delete routes owned by other VPN clients automatically.")
+                                Text("Foreign PPP default paths and stale 0/1 + 128/1 routes are detected but never deleted automatically as another VPN may own them.")
                                     .font(.caption2)
                                     .foregroundColor(.secondary)
                             }
@@ -723,6 +796,8 @@ struct ContentView: View {
                                 .controlSize(.large)
                             Spacer()
                         }
+
+                        AppFooter(updater: updater)
                     }
                     .padding(24)
                 }
@@ -732,7 +807,23 @@ struct ContentView: View {
             ZStack {
                 background
                 VStack(alignment: .leading, spacing: 14) {
-                    AppHeader(title: "Extended Diagnostics", subtitle: "Routes, DNS, TCP, ping and traceroute", icon: "stethoscope")
+                    AppHeader(title: "Extended Diagnostics", subtitle: "DNS, routes, TCP, ping, traceroute and watchdog state", icon: "stethoscope")
+
+                    AppCard {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Support summary").font(.headline)
+                                Text(vpn.ready ? "Components ready" : "Components require setup")
+                                    .font(.caption)
+                                    .foregroundColor(vpn.ready ? .green : .orange)
+                                Text(vpn.networkWarning ? "VPN route conflict detected" : "VPN route conflict check is clean")
+                                    .font(.caption)
+                                    .foregroundColor(vpn.networkWarning ? .orange : .green)
+                            }
+                            Spacer()
+                            StatusPill(color: vpn.statusColor, text: vpn.statusText)
+                        }
+                    }
 
                     AppCard {
                         VStack(alignment: .leading, spacing: 10) {
@@ -757,12 +848,13 @@ struct ContentView: View {
                             .buttonStyle(.borderedProminent)
                             .disabled(vpn.diagnosticsRunning)
                         Button("Copy") { vpn.copyDiagnostics() }.disabled(vpn.diagnostics.isEmpty)
+                        Button("Save report…") { vpn.saveDiagnostics() }.disabled(vpn.diagnostics.isEmpty)
                         Button("Check VPN leftovers") { vpn.runNetworkAudit() }
                         Button("Repair this app") { vpn.repairNetworking() }
                         Spacer()
                     }
 
-                    Text("Traceroute uses up to 12 hops with one probe per hop. Missing hops can be normal when ICMP/UDP is filtered; compare with the TCP test.")
+                    Text("Traceroute uses up to 12 hops with one probe per hop. Missing hops can be normal when ICMP/UDP is filtered; compare route, TCP and ping results.")
                         .font(.caption)
                         .foregroundColor(.secondary)
 
@@ -775,20 +867,34 @@ struct ContentView: View {
                     }
                     .background(
                         RoundedRectangle(cornerRadius: 14)
-                            .fill(Color(nsColor: .textBackgroundColor).opacity(0.88))
+                            .fill(Color(nsColor: .textBackgroundColor).opacity(0.9))
                     )
+
+                    AppFooter(updater: updater)
                 }
                 .padding(24)
             }
             .tabItem { Label("Diagnostics", systemImage: "stethoscope") }
+
+            ZStack {
+                background
+                AboutView(updater: updater)
+            }
+            .tabItem { Label("About", systemImage: "info.circle") }
         }
-        .frame(width: 820, height: 660)
+        .frame(width: 900, height: 720)
+        .onAppear {
+            statusBar.bind(vpn)
+            profiles.applySelected(to: vpn)
+        }
     }
 }
 
 @main
 struct SSTPClientGUIApp: App {
     var body: some Scene {
-        WindowGroup("SSTP Client GUI") { ContentView() }
+        WindowGroup("SSTP Client GUI") {
+            ContentView()
+        }
     }
 }
