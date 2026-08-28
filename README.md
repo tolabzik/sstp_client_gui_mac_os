@@ -1,36 +1,210 @@
 # SSTP Client GUI for macOS
 
-Нативный графический SSTP-клиент для macOS поверх [`sstp-client`](https://gitlab.com/sstp-project/sstp-client).
+[![Latest Release](https://img.shields.io/github/v/release/tolabzik/sstp_client_gui_mac_os)](https://github.com/tolabzik/sstp_client_gui_mac_os/releases/latest)
+[![Build macOS app](https://github.com/tolabzik/sstp_client_gui_mac_os/actions/workflows/build.yml/badge.svg)](https://github.com/tolabzik/sstp_client_gui_mac_os/actions/workflows/build.yml)
+![macOS](https://img.shields.io/badge/macOS-12%2B-black)
+![Universal](https://img.shields.io/badge/macOS-arm64%20%2B%20x86__64-blue)
 
-Приложение предназначено для пользователей и техподдержки, которым нужен SSTP VPN без ручного запуска `sstpc`, настройки PPP и маршрутов через Terminal.
+Нативный GUI-клиент SSTP VPN для macOS поверх `sstp-client`.
 
-Текущая версия: **1.2.1**.
+Проект рассчитан как на обычного пользователя, так и на техподдержку: приложение устанавливает необходимые компоненты, хранит пароль в Keychain, безопасно включает Full Tunnel, отслеживает конфликты с другими VPN, собирает расширенную диагностику и умеет обновляться из GitHub Releases.
 
-## Основные возможности
+**Актуальная ветка приложения: 1.3.x.**
 
-- SwiftUI GUI для macOS;
-- macOS 12+;
-- Universal Binary: **Apple Silicon (`arm64`) + Intel (`x86_64`)**;
-- Server / Login / Password;
-- хранение VPN-пароля в macOS Keychain;
-- Full Tunnel для IPv4;
-- self-signed сертификаты через `--cert-warn`;
-- возможность выбрать CA/server certificate;
-- автоматическая проверка PPP перед включением Full Tunnel;
-- rollback маршрутов при ошибке;
-- определение чужих PPP/VPN-интерфейсов;
-- проверка оставшихся `0/1` и `128/1` маршрутов;
-- приложение не удаляет чужие VPN-маршруты автоматически;
-- `Repair this app` очищает только состояние, созданное этим приложением;
-- расширенная диагностика DNS / route / ping / TCP / traceroute;
-- генерация собственной `.icns` иконки при сборке;
-- автоматическая установка собранного приложения в `/Applications`.
+## Скачать готовую версию
+
+Для обычного пользователя **ничего компилировать не нужно**.
+
+Откройте:
+
+https://github.com/tolabzik/sstp_client_gui_mac_os/releases/latest
+
+Скачайте файл вида:
+
+```text
+SSTP-Client-GUI-macOS-vX.Y.Z.zip
+```
+
+Внутри находится один Universal `.app`, который работает на:
+
+- Apple Silicon — `arm64`;
+- Intel Mac — `x86_64`.
+
+Также к релизу прикладывается `.sha256` файл для проверки архива.
 
 ---
 
-# Быстрый старт для обычного пользователя
+# Возможности
 
-Если есть готовый архив `SSTP-Client-GUI-macOS.zip`, распакуйте его и перенесите:
+## VPN
+
+- SSTP через `sstp-client`;
+- Server / Login / Password;
+- поддержка `DOMAIN\username`;
+- VPN password хранится в macOS Keychain;
+- Full Tunnel для всего IPv4;
+- self-signed certificates через `--cert-warn`;
+- выбор CA/server certificate;
+- сохранённые VPN-профили;
+- Connect / Disconnect;
+- menu bar icon для быстрого управления.
+
+## Защита маршрутизации
+
+Перед включением Full Tunnel приложение:
+
+1. определяет физический default gateway;
+2. фиксирует маршрут до самого SSTP-сервера через физический интерфейс;
+3. запускает SSTP;
+4. ждёт новый PPP-интерфейс;
+5. проверяет выход в Internet именно через этот PPP;
+6. только после успешной проверки включает Full Tunnel;
+7. повторно проверяет маршрут и доступность Internet.
+
+Для Full Tunnel используются:
+
+```text
+0.0.0.0/1
+128.0.0.0/1
+```
+
+Вместе они покрывают весь IPv4, но обычный default route macOS не удаляется.
+
+Если проверка не проходит, выполняется rollback.
+
+## Watchdog
+
+После успешного подключения запускается root watchdog.
+
+Если `sstpc` неожиданно завершается, watchdog:
+
+- проверяет состояние текущей SSTP-сессии;
+- удаляет только split-default маршруты, относящиеся к PPP этой сессии;
+- убирает собственный host route до SSTP server;
+- возвращает обычную маршрутизацию;
+- записывает причину в state/result и watchdog log.
+
+Это снижает вероятность оставить Mac без Internet после аварийного обрыва VPN.
+
+## Другие VPN
+
+Приложение обнаруживает:
+
+- другие `pppX` interfaces;
+- default traffic через чужой PPP;
+- оставшиеся `0/1` routes;
+- оставшиеся `128/1` routes;
+- Full Tunnel, который не относится к текущей SSTP-сессии.
+
+Чужие VPN routes автоматически не удаляются.
+
+Если найден конфликт, Setup показывает статус **Review**.
+
+## Network Health
+
+Во вкладке Setup отображается быстрый live health check:
+
+- Homebrew / sstpc / pppd / PPP options;
+- PPP state;
+- route до `1.1.1.1`;
+- Internet TCP test;
+- DNS resolution;
+- TCP/443 до SSTP server;
+- VPN conflicts.
+
+## Diagnostics
+
+Для произвольного Host/IP и TCP port выполняются:
+
+- DNS lookup;
+- `route -n get`;
+- ping;
+- TCP connect;
+- traceroute до 12 hops.
+
+Дополнительно отчёт содержит:
+
+- версию и build SSTP Client GUI;
+- macOS version;
+- CPU architecture;
+- Homebrew;
+- `sstpc`;
+- `pppd`;
+- PPP interfaces;
+- root watchdog state;
+- VPN conflict check;
+- default route;
+- route / ping / TCP / traceroute до SSTP server;
+- route / ping / TCP / traceroute до Internet;
+- proxy configuration;
+- ARP;
+- DNS;
+- routing table;
+- app state;
+- SSTP log.
+
+Отчёт можно:
+
+- Copy;
+- сохранить через **Save report…**.
+
+VPN password в диагностический process list не выводится.
+
+---
+
+# Автообновление
+
+Начиная с 1.3.x приложение умеет проверять GitHub Releases самостоятельно.
+
+Во вкладке **About** есть:
+
+```text
+Check for updates
+Install update
+Open latest release
+```
+
+По умолчанию включена автоматическая проверка наличия новой версии при запуске.
+
+Алгоритм установки обновления:
+
+```text
+GitHub Releases API
+        ↓
+поиск более новой SemVer версии
+        ↓
+скачивание ZIP + SHA-256
+        ↓
+проверка SHA-256
+        ↓
+распаковка
+        ↓
+codesign --verify
+        ↓
+проверка Bundle ID
+        ↓
+проверка версии
+        ↓
+замена /Applications/SSTP Client GUI.app
+        ↓
+перезапуск приложения
+```
+
+Обновление принимается только из Releases этого репозитория:
+
+```text
+https://github.com/tolabzik/sstp_client_gui_mac_os
+```
+
+Для замены приложения в `/Applications` macOS запросит пароль локального администратора.
+
+> Текущие публичные сборки имеют ad-hoc подпись. Для полностью бесшовной публичной установки без предупреждений Gatekeeper нужен Apple Developer ID + notarization.
+
+---
+
+# Первый запуск
+
+Распакуйте ZIP и перенесите:
 
 ```text
 SSTP Client GUI.app
@@ -42,240 +216,40 @@ SSTP Client GUI.app
 /Applications
 ```
 
-При первом запуске ad-hoc сборки macOS может потребовать открыть приложение через:
+При первом запуске ad-hoc build macOS может потребовать:
 
-1. ПКМ по приложению.
-2. **Open / Открыть**.
-3. Повторно подтвердить запуск.
+1. ПКМ по приложению;
+2. **Open / Открыть**;
+3. подтвердить запуск ещё раз.
 
-Для публичного распространения без предупреждений Gatekeeper требуется Developer ID + notarization от Apple.
-
----
-
-# Чистая сборка на Mac с нуля
-
-Ниже сценарий для Mac, на котором исходников проекта больше нет.
-
-## 1. Проверить Xcode Command Line Tools
+Для доверенной внутренней сборки при необходимости quarantine можно снять вручную:
 
 ```bash
-xcode-select -p
-```
-
-Если инструменты не установлены:
-
-```bash
-xcode-select --install
-```
-
-После завершения установки снова открыть Terminal.
-
-Xcode Command Line Tools дают необходимые `git`, `swiftc`, `lipo`, `codesign`, `iconutil` и SDK macOS.
-
-## 2. Удалить старый локальный clone, если он есть
-
-```bash
-rm -rf ~/Desktop/sstp_client_gui_mac_os
-```
-
-Это удаляет только локальный clone репозитория. Установленное приложение в `/Applications` данной командой не удаляется.
-
-## 3. Клонировать проект
-
-```bash
-cd ~/Desktop
-git clone https://github.com/tolabzik/sstp_client_gui_mac_os.git
-cd sstp_client_gui_mac_os
-```
-
-Репозиторий публичный, поэтому для HTTPS clone SSH-ключ GitHub не требуется.
-
-## 4. Сделать build script исполняемым
-
-```bash
-chmod +x build.sh
-```
-
-## 5. Чисто собрать и сразу установить приложение
-
-Рекомендуемый вариант для разработчика:
-
-```bash
-./build.sh --install
-```
-
-Команда автоматически:
-
-1. удаляет старые `dist` и `.build`;
-2. генерирует `.icns`;
-3. собирает `arm64`;
-4. собирает `x86_64`;
-5. объединяет бинарники через `lipo`;
-6. выполняет `codesign`;
-7. проверяет подпись;
-8. создаёт ZIP;
-9. закрывает запущенную старую копию GUI;
-10. удаляет старый `/Applications/SSTP Client GUI.app`;
-11. копирует новую сборку в `/Applications`;
-12. проверяет установленную версию и архитектуры;
-13. запускает приложение.
-
-macOS запросит пароль локального администратора при замене приложения в `/Applications`.
-
----
-
-# Один блок команд для чистой пересборки
-
-Если Command Line Tools уже установлены:
-
-```bash
-cd ~/Desktop
-rm -rf sstp_client_gui_mac_os
-
-git clone https://github.com/tolabzik/sstp_client_gui_mac_os.git
-cd sstp_client_gui_mac_os
-chmod +x build.sh
-./build.sh --install
-```
-
-После успешной сборки приложение находится здесь:
-
-```text
-/Applications/SSTP Client GUI.app
-```
-
-Архив для передачи пользователям:
-
-```text
-~/Desktop/sstp_client_gui_mac_os/dist/SSTP-Client-GUI-macOS.zip
+xattr -dr com.apple.quarantine "/Applications/SSTP Client GUI.app"
 ```
 
 ---
 
-# Ключи `build.sh`
+# Первичная настройка Mac
 
-## Обычная сборка
+Откройте вкладку **Setup**.
 
-```bash
-./build.sh
-```
-
-Создаёт:
+Приложение проверит:
 
 ```text
-dist/SSTP Client GUI.app
-dist/SSTP-Client-GUI-macOS.zip
+Homebrew
+sstp-client
+/usr/sbin/pppd
+/etc/ppp/options
 ```
 
-Но не изменяет `/Applications`.
-
-## Чистая сборка + установка
-
-```bash
-./build.sh --install
-```
-
-Пересобирает приложение с нуля, заменяет копию в `/Applications` и запускает её.
-
-## Установить уже собранную копию
-
-```bash
-./build.sh --install-only
-```
-
-Использует уже существующий:
+Если компонентов нет, нажмите:
 
 ```text
-dist/SSTP Client GUI.app
+Install components
 ```
 
-Новая компиляция при этом не выполняется.
-
-## Помощь
-
-```bash
-./build.sh --help
-```
-
----
-
-# Подпись приложения
-
-По умолчанию используется ad-hoc подпись:
-
-```bash
-codesign --sign -
-```
-
-Для собственной Developer ID подписи можно передать identity через переменную окружения:
-
-```bash
-SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" ./build.sh --install
-```
-
-`SIGN_IDENTITY` — это не VPN-пароль и не GitHub token. Это имя сертификата подписи Apple, установленного в Keychain сборочной машины.
-
-Для внешнего распространения также рекомендуется notarization.
-
----
-
-# Проверка установленной сборки
-
-## Версия
-
-```bash
-/usr/libexec/PlistBuddy \
-  -c 'Print :CFBundleShortVersionString' \
-  "/Applications/SSTP Client GUI.app/Contents/Info.plist"
-```
-
-Ожидается:
-
-```text
-1.2.1
-```
-
-## Архитектуры
-
-```bash
-lipo -archs \
-  "/Applications/SSTP Client GUI.app/Contents/MacOS/SSTPClientGUI"
-```
-
-Ожидается две архитектуры:
-
-```text
-x86_64 arm64
-```
-
-Порядок архитектур в выводе значения не имеет.
-
-## Подпись
-
-```bash
-codesign --verify \
-  --deep \
-  --strict \
-  --verbose=2 \
-  "/Applications/SSTP Client GUI.app"
-```
-
----
-
-# Первичная настройка SSTP на пользовательском Mac
-
-Открыть приложение и перейти во вкладку **Setup**.
-
-GUI проверяет:
-
-- Homebrew;
-- `sstp-client`;
-- `/usr/sbin/pppd`;
-- `/etc/ppp/options`.
-
-Если зависимостей нет, нажать **Install components**.
-
-Установщик выполняет необходимые действия, включая:
+Установщик при необходимости установит Homebrew и выполнит:
 
 ```bash
 brew install sstp-client
@@ -283,13 +257,13 @@ sudo mkdir -p /etc/ppp
 sudo touch /etc/ppp/options
 ```
 
-После установки нажать **Check again**.
+После этого нажмите **Check again**.
 
 ---
 
-# Настройка VPN
+# Настройка подключения
 
-Во вкладке **VPN** заполнить:
+Во вкладке **VPN** заполните:
 
 ```text
 Server
@@ -297,29 +271,23 @@ Login
 Password
 ```
 
-Для доменной учётной записи:
+Доменная учётная запись:
 
 ```text
 DOMAIN\username
 ```
 
-Пароль сохраняется в **macOS Keychain**.
+## Сертификат
 
-Он не должен быть прописан в исходниках проекта или README.
+Рекомендуемый режим — выбрать CA/server certificate и оставить нормальную проверку сертификата.
 
----
-
-# Сертификат
-
-Рекомендуемый вариант — использовать нормальную проверку сертификата и выбрать CA/server certificate.
-
-Для известных self-signed SSTP-серверов можно включить:
+Для известного self-signed SSTP server можно включить:
 
 ```text
 Ignore certificate verification
 ```
 
-В этом режиме используется:
+В этом случае используется:
 
 ```text
 --cert-warn
@@ -329,115 +297,218 @@ Ignore certificate verification
 
 ---
 
-# Full Tunnel
+# VPN Profiles
 
-При Full Tunnel приложение направляет весь IPv4-трафик через PPP.
+Можно сохранить несколько профилей.
 
-Используются маршруты:
+В профиль сохраняются:
 
-```text
-0.0.0.0/1
-128.0.0.0/1
-```
+- profile name;
+- server;
+- login;
+- Full Tunnel;
+- certificate mode;
+- certificate path.
 
-Вместе они покрывают весь IPv4, но не удаляют обычный default route macOS.
-
-Перед их установкой приложение:
-
-1. фиксирует физический маршрут до SSTP-сервера;
-2. запускает `sstpc`;
-3. ждёт новый PPP;
-4. проверяет доступ в интернет именно через этот PPP;
-5. только после успешной проверки включает Full Tunnel;
-6. повторно проверяет маршрутизацию;
-7. при ошибке выполняет rollback.
+Пароль в profile JSON не записывается. Он остаётся в macOS Keychain.
 
 ---
 
-# Другие VPN и остаточные маршруты
+# Menu Bar
 
-Во вкладке **Setup** есть проверка VPN conflicts.
+После запуска появляется значок SSTP Client GUI в menu bar macOS.
 
-Приложение ищет:
-
-- другие `pppX` интерфейсы;
-- default-трафик через чужой PPP;
-- оставшиеся `0/1` маршруты;
-- оставшиеся `128/1` маршруты;
-- Full Tunnel, который не принадлежит текущей SSTP-сессии.
-
-Если найден конфликт, отображается **Review**.
-
-Приложение не должно автоматически удалять маршруты другого VPN-клиента.
-
-Кнопка:
+Через него доступны:
 
 ```text
+Status
+Show SSTP Client GUI
+Connect / Disconnect
 Repair this app
+Open GitHub
 ```
-
-очищает только SSTP-процесс и маршруты, которыми управляет этот GUI.
 
 ---
 
-# Расширенная диагностика
+# Notifications
 
-Во вкладке **Diagnostics** можно указать:
+Во вкладке **About** можно включить macOS notifications.
 
-```text
-Host / IP
-TCP port
+Уведомления используются для:
+
+- VPN connected;
+- VPN disconnected;
+- VPN error;
+- new application version;
+- successful update.
+
+---
+
+# Сборка из исходников
+
+## Требования
+
+- macOS 12+;
+- Xcode или Xcode Command Line Tools.
+
+Проверка:
+
+```bash
+xcode-select -p
+xcrun --find swiftc
 ```
 
-Для указанного узла выполняются:
+Если CLT отсутствуют:
 
-- DNS resolution;
-- `route -n get`;
-- ping;
-- TCP connect;
-- traceroute до 12 hops.
+```bash
+xcode-select --install
+```
 
-Дополнительно отчёт содержит:
+## Чистая сборка
 
-- версию macOS;
-- архитектуру;
-- Homebrew;
-- `sstpc`;
-- `pppd`;
-- PPP-интерфейсы;
-- VPN conflict check;
-- default route;
-- маршрут до SSTP-сервера;
-- TCP/443 до SSTP-сервера;
-- traceroute до SSTP-сервера;
-- маршрут и traceroute до `1.1.1.1`;
-- DNS;
-- proxy;
-- ARP;
-- routing table;
-- состояние GUI;
-- последние строки SSTP log.
+```bash
+cd ~/Desktop
+rm -rf sstp_client_gui_mac_os
 
-VPN-пароль в диагностический отчёт намеренно не выводится.
+git clone https://github.com/tolabzik/sstp_client_gui_mac_os.git
+cd sstp_client_gui_mac_os
+chmod +x build.sh
+./build.sh
+```
 
-`*` в traceroute сам по себе не доказывает проблему: ICMP/UDP может фильтроваться, даже если TCP до конечного узла работает.
+Результат:
+
+```text
+dist/SSTP Client GUI.app
+dist/SSTP-Client-GUI-macOS.zip
+```
+
+## Сборка + установка
+
+```bash
+./build.sh --install
+```
+
+Команда:
+
+- очищает старые `.build` и `dist`;
+- генерирует `.icns`;
+- собирает arm64;
+- собирает x86_64;
+- объединяет их через `lipo`;
+- подписывает приложение;
+- проверяет `codesign`;
+- создаёт ZIP;
+- заменяет `/Applications/SSTP Client GUI.app`;
+- проверяет установленную версию и архитектуры;
+- запускает приложение.
+
+## Только установить существующий dist
+
+```bash
+./build.sh --install-only
+```
+
+## Проверить Universal binary
+
+```bash
+lipo -archs \
+  "dist/SSTP Client GUI.app/Contents/MacOS/SSTPClientGUI"
+```
+
+Должны присутствовать обе архитектуры:
+
+```text
+arm64 x86_64
+```
+
+Порядок не имеет значения.
+
+---
+
+# GitHub Releases
+
+GitHub Actions выполняется на push в `main` и на pull request.
+
+Pipeline:
+
+```text
+Checkout
+  ↓
+Universal build
+  ↓
+codesign verification
+  ↓
+read CFBundleShortVersionString
+  ↓
+versioned ZIP
+  ↓
+SHA-256
+  ↓
+Actions artifact
+  ↓
+GitHub Release vX.Y.Z
+```
+
+Если Release с текущим номером версии уже существует, повторный релиз не создаётся.
+
+Чтобы выпустить новую версию, нужно увеличить:
+
+```text
+CFBundleShortVersionString
+```
+
+в `build.sh`.
+
+Release автоматически получает название:
+
+```text
+SSTP Client GUI vX.Y.Z
+```
+
+и assets:
+
+```text
+SSTP-Client-GUI-macOS-vX.Y.Z.zip
+SSTP-Client-GUI-macOS-vX.Y.Z.zip.sha256
+```
+
+---
+
+# Developer ID
+
+Локально можно собрать приложение с реальным Developer ID:
+
+```bash
+SIGN_IDENTITY="Developer ID Application: Name (TEAMID)" ./build.sh
+```
+
+Для публичного распространения также требуется notarization.
+
+Без Developer ID используется ad-hoc signature:
+
+```text
+-
+```
 
 ---
 
 # Файлы проекта
 
 ```text
-Sources/SSTPClientGUI.swift   SwiftUI GUI и диагностика
-Resources/vpnctl.sh          SSTP, PPP, маршруты и rollback
-Resources/setup.sh           установка зависимостей
-Tools/make_icon.swift        генерация AppIcon.icns
-build.sh                     Universal build + install
-.github/workflows/build.yml  GitHub Actions build
+Sources/SSTPClientGUI.swift   основная VPN логика и SwiftUI UI
+Sources/AppSupport.swift      updates, profiles, health, menu bar, notifications
+Resources/vpnctl.sh           SSTP, PPP, routes, rollback и root watchdog
+Resources/setup.sh            установка зависимостей
+Tools/make_icon.swift         генерация AppIcon.icns
+build.sh                      Universal build + local install
+.github/workflows/build.yml  CI + GitHub Releases
+CHANGELOG.md                  история версий
 ```
 
 ---
 
-# Временные файлы
+# Служебные файлы
 
 Во время работы используются:
 
@@ -446,31 +517,51 @@ build.sh                     Universal build + install
 /tmp/sstp-gui.pid
 /tmp/sstp-gui.state
 /tmp/sstp-gui.result
+/tmp/sstp-gui-watchdog.pid
+/tmp/sstp-gui-watchdog.log
 ```
 
-VPN-пароль передаётся контроллеру через временный файл с правами `0600`, после чтения файл удаляется.
+Временный password handoff имеет права `0600` и удаляется контроллером сразу после чтения.
 
 ---
 
 # Безопасность
 
-- не публикуйте реальные VPN-пароли;
-- не коммитьте приватные корпоративные сертификаты;
-- используйте `--cert-warn` только при необходимости;
-- диагностические отчёты могут содержать внутренние IP/DNS/маршруты;
-- для публичной доставки предпочтительны Developer ID + notarization;
-- для Full Tunnel VPN-шлюз должен разрешать выход клиентского трафика в интернет.
+- не добавляйте VPN passwords в repository;
+- не публикуйте приватные corporate certificates;
+- VPN password хранится в Keychain;
+- `--cert-warn` используйте только для известного SSTP server;
+- self-update проверяет SHA-256, `codesign`, Bundle ID и version;
+- auto-update принимает assets только из официального GitHub repository;
+- приложение не удаляет routes другого VPN автоматически;
+- diagnostic report может содержать internal IP, DNS suffix и routing information.
+
+Проект использует upstream `sstp-client`. При передаче password через `--password` upstream клиент предпринимает меры для сокрытия credentials из process arguments после запуска, однако для чувствительных окружений всё равно рекомендуется дополнительно оценить требования вашей модели угроз.
 
 ---
 
-# Обновление существующего clone
+# Troubleshooting
 
-Если репозиторий уже есть локально:
+Если VPN не работает:
 
-```bash
-cd ~/Desktop/sstp_client_gui_mac_os
-git pull --ff-only
-./build.sh --install
+1. Setup → **Check again**;
+2. Setup → **Check VPN leftovers**;
+3. убедитесь, что другой Full Tunnel VPN выключен;
+4. Diagnostics → укажите Host/IP и port;
+5. **Run extended diagnostics**;
+6. **Save report…** или **Copy**;
+7. приложите отчёт к обращению в поддержку.
+
+Если приложение считает, что от него остались routes:
+
+```text
+Repair this app
 ```
 
-Этого достаточно для обычной пересборки после изменений в `main`.
+Функция предназначена только для состояния, созданного SSTP Client GUI.
+
+---
+
+# Changelog
+
+См. [CHANGELOG.md](CHANGELOG.md).
