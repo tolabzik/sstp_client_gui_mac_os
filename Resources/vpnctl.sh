@@ -30,9 +30,55 @@ write_result() {
   chmod 0644 "$RESULT" 2>/dev/null || true
 }
 
+read_state() {
+  STATE_PPP=""
+  STATE_PHY=""
+  STATE_GW=""
+  STATE_SERVER=""
+
+  [ -f "$STATEFILE" ] || return 0
+  STATE="$(cat "$STATEFILE" 2>/dev/null || true)"
+  OLD_IFS="$IFS"
+  IFS='|'
+  set -- $STATE
+  IFS="$OLD_IFS"
+
+  STATE_PPP="${1:-}"
+  STATE_PHY="${2:-}"
+  STATE_GW="${3:-}"
+  STATE_SERVER="${4:-}"
+}
+
+route_interface() {
+  /sbin/route -n get "$1" 2>/dev/null | /usr/bin/awk '/interface:/{print $2; exit}'
+}
+
+route_gateway() {
+  /sbin/route -n get "$1" 2>/dev/null | /usr/bin/awk '/gateway:/{print $2; exit}'
+}
+
+split_route_owned_by() {
+  DEST="$1"
+  PPP="$2"
+  [ -n "$PPP" ] || return 1
+  /usr/sbin/netstat -rn -f inet 2>/dev/null | /usr/bin/awk -v dest="$DEST" -v ppp="$PPP" '
+    $1 == dest {
+      for (i = 1; i <= NF; i++) if ($i == ppp) found = 1
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
 cleanup_test_routes() {
-  /sbin/route -n delete -host 1.1.1.1 >/dev/null 2>&1 || true
-  /sbin/route -n delete -host 1.0.0.1 >/dev/null 2>&1 || true
+  read_state
+  [ -n "$STATE_PPP" ] || return 0
+
+  for PROBE in 1.1.1.1 1.0.0.1; do
+    IFACE="$(route_interface "$PROBE")"
+    if [ "$IFACE" = "$STATE_PPP" ]; then
+      /sbin/route -n delete -host "$PROBE" -interface "$STATE_PPP" >/dev/null 2>&1 || true
+    fi
+  done
 }
 
 stop_watchdog() {
@@ -52,19 +98,36 @@ kill_owned_client() {
   if [ -f "$PIDFILE" ]; then
     PID="$(cat "$PIDFILE" 2>/dev/null || true)"
     if [ -n "${PID:-}" ] && kill -0 "$PID" >/dev/null 2>&1; then
-      kill -TERM "$PID" >/dev/null 2>&1 || true
-      sleep 1
-      kill -KILL "$PID" >/dev/null 2>&1 || true
+      COMM="$(/bin/ps -p "$PID" -o comm= 2>/dev/null || true)"
+      if printf '%s' "$COMM" | /usr/bin/grep -q 'sstpc'; then
+        kill -TERM "$PID" >/dev/null 2>&1 || true
+        sleep 1
+        kill -KILL "$PID" >/dev/null 2>&1 || true
+      fi
     fi
   fi
 }
 
 delete_owned_routes() {
+  read_state
   cleanup_test_routes
-  /sbin/route -n delete -net 0.0.0.0/1 >/dev/null 2>&1 || true
-  /sbin/route -n delete -net 128.0.0.0/1 >/dev/null 2>&1 || true
-  if [ -n "$SERVER" ]; then
-    /sbin/route -n delete -host "$SERVER" >/dev/null 2>&1 || true
+
+  if [ -n "$STATE_PPP" ]; then
+    if split_route_owned_by "0/1" "$STATE_PPP" || split_route_owned_by "0.0.0.0/1" "$STATE_PPP"; then
+      /sbin/route -n delete -net 0.0.0.0/1 -interface "$STATE_PPP" >/dev/null 2>&1 || true
+    fi
+
+    if split_route_owned_by "128.0/1" "$STATE_PPP" || split_route_owned_by "128.0.0.0/1" "$STATE_PPP"; then
+      /sbin/route -n delete -net 128.0.0.0/1 -interface "$STATE_PPP" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if [ -n "$STATE_SERVER" ] && [ -n "$STATE_GW" ] && [ -n "$STATE_PHY" ]; then
+    CURRENT_GW="$(route_gateway "$STATE_SERVER")"
+    CURRENT_IF="$(route_interface "$STATE_SERVER")"
+    if [ "$CURRENT_GW" = "$STATE_GW" ] && [ "$CURRENT_IF" = "$STATE_PHY" ]; then
+      /sbin/route -n delete -host "$STATE_SERVER" "$STATE_GW" >/dev/null 2>&1 || true
+    fi
   fi
 }
 
@@ -102,10 +165,10 @@ probe_via_ppp() {
   for PROBE in 1.1.1.1 1.0.0.1; do
     if /sbin/route -n add -host "$PROBE" -interface "$PPP" >/dev/null 2>&1; then
       if /usr/bin/nc -z -G 5 "$PROBE" 443 >/dev/null 2>&1; then
-        /sbin/route -n delete -host "$PROBE" >/dev/null 2>&1 || true
+        /sbin/route -n delete -host "$PROBE" -interface "$PPP" >/dev/null 2>&1 || true
         return 0
       fi
-      /sbin/route -n delete -host "$PROBE" >/dev/null 2>&1 || true
+      /sbin/route -n delete -host "$PROBE" -interface "$PPP" >/dev/null 2>&1 || true
     fi
   done
   return 1
@@ -118,35 +181,24 @@ conflicting_full_tunnel_routes() {
 }
 
 watchdog_cleanup_after_crash() {
-  [ -f "$STATEFILE" ] || return 0
+  read_state
+  [ -n "$STATE_PPP" ] || return 0
 
-  STATE="$(cat "$STATEFILE" 2>/dev/null || true)"
-  OLD_IFS="$IFS"
-  IFS='|'
-  set -- $STATE
-  IFS="$OLD_IFS"
+  if split_route_owned_by "0/1" "$STATE_PPP" || split_route_owned_by "0.0.0.0/1" "$STATE_PPP"; then
+    /sbin/route -n delete -net 0.0.0.0/1 -interface "$STATE_PPP" >/dev/null 2>&1 || true
+  fi
 
-  PPP="${1:-}"
-  PHY="${2:-}"
-  GW="${3:-}"
-  SAVED_SERVER="${4:-}"
-
-  if [ -n "$PPP" ]; then
-    ROUTES="$(conflicting_full_tunnel_routes)"
-    if printf '%s\n' "$ROUTES" | /usr/bin/grep -qE "(^|[[:space:]])${PPP}([[:space:]]|$)"; then
-      /sbin/route -n delete -net 0.0.0.0/1 >/dev/null 2>&1 || true
-      /sbin/route -n delete -net 128.0.0.0/1 >/dev/null 2>&1 || true
-    fi
+  if split_route_owned_by "128.0/1" "$STATE_PPP" || split_route_owned_by "128.0.0.0/1" "$STATE_PPP"; then
+    /sbin/route -n delete -net 128.0.0.0/1 -interface "$STATE_PPP" >/dev/null 2>&1 || true
   fi
 
   cleanup_test_routes
 
-  if [ -n "$SAVED_SERVER" ]; then
-    ROUTE_INFO="$(/sbin/route -n get "$SAVED_SERVER" 2>/dev/null || true)"
-    ROUTE_GW="$(printf '%s\n' "$ROUTE_INFO" | /usr/bin/awk '/gateway:/{print $2; exit}')"
-    ROUTE_IF="$(printf '%s\n' "$ROUTE_INFO" | /usr/bin/awk '/interface:/{print $2; exit}')"
-    if [ -n "$GW" ] && [ -n "$PHY" ] && [ "$ROUTE_GW" = "$GW" ] && [ "$ROUTE_IF" = "$PHY" ]; then
-      /sbin/route -n delete -host "$SAVED_SERVER" >/dev/null 2>&1 || true
+  if [ -n "$STATE_SERVER" ] && [ -n "$STATE_GW" ] && [ -n "$STATE_PHY" ]; then
+    CURRENT_GW="$(route_gateway "$STATE_SERVER")"
+    CURRENT_IF="$(route_interface "$STATE_SERVER")"
+    if [ "$CURRENT_GW" = "$STATE_GW" ] && [ "$CURRENT_IF" = "$STATE_PHY" ]; then
+      /sbin/route -n delete -host "$STATE_SERVER" "$STATE_GW" >/dev/null 2>&1 || true
     fi
   fi
 
@@ -223,8 +275,13 @@ case "$ACTION" in
     SERVER_IF="$(/sbin/route -n get "$SERVER" 2>/dev/null | /usr/bin/awk '/interface:/{print $2; exit}')"
     [ "$SERVER_IF" = "$PHY" ] || fail "VPN server route points to unexpected interface $SERVER_IF"
 
+    # Persist enough ownership information immediately so a later failure can
+    # safely remove only the host route created by this session.
+    printf '|%s|%s|%s\n' "$PHY" "$GW" "$SERVER" > "$STATEFILE"
+    chmod 0644 "$STATEFILE" 2>/dev/null || true
+
     PPP_BEFORE="$(list_ppp)"
-    rm -f "$LOG" "$PIDFILE" "$STATEFILE" "$WATCHDOG_LOG"
+    rm -f "$LOG" "$PIDFILE" "$WATCHDOG_LOG"
     : > "$LOG"
     chmod 0644 "$LOG" 2>/dev/null || true
 
@@ -261,6 +318,10 @@ case "$ACTION" in
 
     [ -n "$PPP" ] || fail "SSTP connected, but no new PPP interface appeared"
 
+    # From this point route cleanup is bound to this exact PPP interface.
+    printf '%s|%s|%s|%s\n' "$PPP" "$PHY" "$GW" "$SERVER" > "$STATEFILE"
+    chmod 0644 "$STATEFILE" 2>/dev/null || true
+
     if ! probe_via_ppp "$PPP"; then
       fail "PPP is up, but internet test through this PPP failed"
     fi
@@ -280,8 +341,6 @@ case "$ACTION" in
       fi
     fi
 
-    printf '%s|%s|%s|%s\n' "$PPP" "$PHY" "$GW" "$SERVER" > "$STATEFILE"
-    chmod 0644 "$STATEFILE" 2>/dev/null || true
     write_result "OK|$PPP|$PHY|$GW"
 
     rm -f "$STOPFILE"
