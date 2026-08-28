@@ -10,7 +10,84 @@ SRC="$ROOT/Sources/SSTPClientGUI.swift"
 RES="$ROOT/Resources"
 TOOLS="$ROOT/Tools"
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+INSTALL_APP=0
+OPEN_APP=0
 
+usage() {
+  cat <<'EOF'
+Usage:
+  ./build.sh                 Build Universal app + ZIP
+  ./build.sh --install       Clean build, replace /Applications copy and launch it
+  ./build.sh --install-only  Install already-built dist app and launch it
+EOF
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --install)
+      INSTALL_APP=1
+      OPEN_APP=1
+      ;;
+    --install-only)
+      INSTALL_APP=1
+      OPEN_APP=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $arg"
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+INSTALL_ONLY=0
+for arg in "$@"; do
+  [ "$arg" = "--install-only" ] && INSTALL_ONLY=1
+done
+
+install_app() {
+  local target="/Applications/SSTP Client GUI.app"
+
+  if [ ! -d "$APP" ]; then
+    echo "Build output not found: $APP"
+    exit 1
+  fi
+
+  echo
+  echo "Stopping running SSTP Client GUI..."
+  /usr/bin/pkill -x SSTPClientGUI >/dev/null 2>&1 || true
+  sleep 1
+
+  echo "Replacing application in /Applications..."
+  sudo /bin/rm -rf "$target"
+  sudo /usr/bin/ditto "$APP" "$target"
+
+  # The app is ad-hoc signed unless SIGN_IDENTITY is supplied.
+  # Removing quarantine is useful for trusted internal builds copied locally.
+  sudo /usr/bin/xattr -dr com.apple.quarantine "$target" >/dev/null 2>&1 || true
+
+  echo "Verifying installed application..."
+  /usr/bin/codesign --verify --deep --strict --verbose=2 "$target"
+
+  echo "Installed version: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$target/Contents/Info.plist")"
+  echo "Installed architectures: $(/usr/bin/lipo -archs "$target/Contents/MacOS/SSTPClientGUI")"
+
+  if [ "$OPEN_APP" -eq 1 ]; then
+    echo "Launching installed application..."
+    /usr/bin/open "$target"
+  fi
+}
+
+if [ "$INSTALL_ONLY" -eq 1 ]; then
+  install_app
+  exit 0
+fi
+
+# Always start from a clean local build.
 rm -rf "$DIST" "$WORK"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$WORK"
 
@@ -48,9 +125,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
   <key>CFBundleVersion</key>
-  <string>3</string>
+  <string>4</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.2.0</string>
+  <string>1.2.1</string>
   <key>LSMinimumSystemVersion</key>
   <string>12.0</string>
   <key>NSHighResolutionCapable</key>
@@ -108,3 +185,7 @@ echo
 echo "Build complete:"
 echo "  $APP"
 echo "  $DIST/SSTP-Client-GUI-macOS.zip"
+
+if [ "$INSTALL_APP" -eq 1 ]; then
+  install_app
+fi
