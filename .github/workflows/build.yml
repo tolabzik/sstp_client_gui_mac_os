@@ -7,6 +7,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-15
@@ -25,9 +28,64 @@ jobs:
           lipo -archs "dist/SSTP Client GUI.app/Contents/MacOS/SSTPClientGUI"
           codesign --verify --deep --strict "dist/SSTP Client GUI.app"
 
-      - name: Upload app archive
+          ARCHS="$(lipo -archs "dist/SSTP Client GUI.app/Contents/MacOS/SSTPClientGUI")"
+          echo "Architectures: $ARCHS"
+          echo "$ARCHS" | grep -q arm64
+          echo "$ARCHS" | grep -q x86_64
+
+      - name: Read app version
+        id: version
+        shell: bash
+        run: |
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "dist/SSTP Client GUI.app/Contents/Info.plist")"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid CFBundleShortVersionString: $VERSION"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "App version: $VERSION"
+
+      - name: Prepare versioned archive
+        shell: bash
+        run: |
+          cp "dist/SSTP-Client-GUI-macOS.zip" \
+             "dist/SSTP-Client-GUI-macOS-v${{ steps.version.outputs.version }}.zip"
+          shasum -a 256 \
+             "dist/SSTP-Client-GUI-macOS-v${{ steps.version.outputs.version }}.zip" \
+             > "dist/SSTP-Client-GUI-macOS-v${{ steps.version.outputs.version }}.zip.sha256"
+
+      - name: Upload Actions artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SSTP-Client-GUI-macOS
-          path: dist/SSTP-Client-GUI-macOS.zip
+          name: SSTP-Client-GUI-macOS-v${{ steps.version.outputs.version }}
+          path: |
+            dist/SSTP-Client-GUI-macOS-v${{ steps.version.outputs.version }}.zip
+            dist/SSTP-Client-GUI-macOS-v${{ steps.version.outputs.version }}.zip.sha256
           if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          ZIP="dist/SSTP-Client-GUI-macOS-v${VERSION}.zip"
+          SHA="${ZIP}.sha256"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists. Nothing to publish."
+            echo "Bump CFBundleShortVersionString in build.sh for the next release."
+            exit 0
+          fi
+
+          gh release create "$TAG" \
+            "$ZIP#SSTP Client GUI macOS Universal (Intel + Apple Silicon)" \
+            "$SHA#SHA-256 checksum" \
+            --target "$GITHUB_SHA" \
+            --title "SSTP Client GUI $TAG" \
+            --generate-notes
+
+          echo "Published release $TAG"
