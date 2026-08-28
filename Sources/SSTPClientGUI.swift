@@ -62,6 +62,8 @@ final class VPNModel: ObservableObject {
 
     @Published var diagnostics = ""
     @Published var diagnosticsRunning = false
+    @Published var diagnosticTarget = ""
+    @Published var diagnosticPort = "443"
 
     private let resultFile = "/tmp/sstp-gui.result"
     private let pidFile = "/tmp/sstp-gui.pid"
@@ -113,6 +115,8 @@ final class VPNModel: ObservableObject {
         ignoreCertificate = d.object(forKey: "ignoreCertificate") as? Bool ?? false
         certificatePath = d.string(forKey: "certificatePath") ?? ""
         fullTunnel = d.object(forKey: "fullTunnel") as? Bool ?? true
+        diagnosticTarget = d.string(forKey: "diagnosticTarget") ?? ""
+        diagnosticPort = d.string(forKey: "diagnosticPort") ?? "443"
     }
 
     private func savePreferences() {
@@ -122,6 +126,8 @@ final class VPNModel: ObservableObject {
         d.set(ignoreCertificate, forKey: "ignoreCertificate")
         d.set(certificatePath, forKey: "certificatePath")
         d.set(fullTunnel, forKey: "fullTunnel")
+        d.set(diagnosticTarget, forKey: "diagnosticTarget")
+        d.set(diagnosticPort, forKey: "diagnosticPort")
     }
 
     private func run(_ executable: String, _ args: [String]) -> String {
@@ -135,7 +141,9 @@ final class VPNModel: ObservableObject {
             try p.run()
             p.waitUntilExit()
             return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        } catch { return "" }
+        } catch {
+            return "ERROR: \(error.localizedDescription)\n"
+        }
     }
 
     private func runShell(_ command: String) -> String { run("/bin/bash", ["-lc", command]) }
@@ -332,31 +340,155 @@ final class VPNModel: ObservableObject {
         } catch { status = .error; message = error.localizedDescription }
     }
 
+    func useVPNServerAsDiagnosticTarget() {
+        diagnosticTarget = server
+        savePreferences()
+    }
+
     func runDiagnostics() {
         diagnosticsRunning = true
-        diagnostics = "Running diagnostics..."
-        let serverCopy = server
+        diagnostics = "Running extended diagnostics..."
+        savePreferences()
+
+        let serverCopy = server.trimmingCharacters(in: .whitespacesAndNewlines)
+        let requestedTarget = diagnosticTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+        let targetCopy = requestedTarget.isEmpty ? serverCopy : requestedTarget
+        let parsedPort = Int(diagnosticPort.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 443
+        let portCopy = (1...65535).contains(parsedPort) ? parsedPort : 443
+
         DispatchQueue.global(qos: .userInitiated).async {
             var out = ""
-            func section(_ name: String) { out += "\n=== \(name) ===\n" }
-            section("DATE"); out += self.runShell("date")
-            section("MACOS"); out += self.run("/usr/bin/sw_vers", [])
-            section("ARCH"); out += self.run("/usr/bin/uname", ["-m"])
-            section("HOMEBREW"); out += self.brewPath().map { self.run($0, ["--version"]) } ?? "NOT INSTALLED\n"
-            section("SSTP"); out += self.sstpcPath().map { self.run($0, ["--version"]) + "\nPath: \($0)\n" } ?? "NOT INSTALLED\n"
-            section("PPPD"); out += self.runShell("ls -l /usr/sbin/pppd /etc/ppp/options 2>&1")
-            section("VPN PROCESS"); out += self.runShell("if [ -f /tmp/sstp-gui.pid ]; then PID=$(cat /tmp/sstp-gui.pid); ps -p \"$PID\" -o pid,ppid,user,command; else echo NONE; fi")
-            section("PPP"); out += self.runShell("/sbin/ifconfig | grep -A 12 '^ppp' || true")
-            section("INTERNET ROUTE"); out += self.run("/sbin/route", ["-n", "get", "1.1.1.1"])
-            if !serverCopy.isEmpty {
-                section("VPN SERVER ROUTE"); out += self.run("/sbin/route", ["-n", "get", serverCopy])
-                section("VPN SERVER TCP 443"); out += self.run("/usr/bin/nc", ["-vz", "-G", "5", serverCopy, "443"])
+
+            func section(_ name: String) {
+                out += "\n=== \(name) ===\n"
             }
-            section("ROUTING TABLE"); out += self.runShell("/usr/sbin/netstat -rn -f inet | grep -E 'default|0/1|128.0/1|ppp' || true")
-            section("DNS"); out += self.runShell("/usr/sbin/scutil --dns | head -n 120")
-            section("APP RESULT"); out += self.runShell("cat /tmp/sstp-gui.result 2>/dev/null || echo NONE")
-            section("VPN LOG"); out += self.runShell("tail -n 60 /tmp/sstp-gui.log 2>/dev/null || echo 'No log'")
-            DispatchQueue.main.async { self.diagnostics = out; self.diagnosticsRunning = false }
+
+            func appendCommand(_ executable: String, _ args: [String]) {
+                let result = self.run(executable, args)
+                out += result.isEmpty ? "NO OUTPUT\n" : result
+            }
+
+            func appendHostResolution(_ host: String) {
+                let byName = self.run("/usr/bin/dscacheutil", ["-q", "host", "-a", "name", host])
+                if !byName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    out += byName
+                    return
+                }
+                let byAddress = self.run("/usr/bin/dscacheutil", ["-q", "host", "-a", "ip_address", host])
+                out += byAddress.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "NO DNS RESULT\n" : byAddress
+            }
+
+            func appendTrace(_ host: String) {
+                appendCommand("/usr/sbin/traceroute", ["-n", "-m", "12", "-w", "1", "-q", "1", host])
+            }
+
+            section("DATE")
+            appendCommand("/bin/date", [])
+
+            section("MACOS")
+            appendCommand("/usr/bin/sw_vers", [])
+
+            section("ARCH")
+            appendCommand("/usr/bin/uname", ["-m"])
+
+            section("NETWORK PATH SNAPSHOT")
+            appendCommand("/usr/sbin/scutil", ["--nwi"])
+
+            section("PROXY CONFIGURATION")
+            appendCommand("/usr/sbin/scutil", ["--proxy"])
+
+            section("DEFAULT ROUTE")
+            appendCommand("/sbin/route", ["-n", "get", "default"])
+
+            section("HOMEBREW")
+            out += self.brewPath().map { self.run($0, ["--version"]) } ?? "NOT INSTALLED\n"
+
+            section("SSTP")
+            out += self.sstpcPath().map { self.run($0, ["--version"]) + "\nPath: \($0)\n" } ?? "NOT INSTALLED\n"
+
+            section("PPPD")
+            out += self.runShell("ls -l /usr/sbin/pppd /etc/ppp/options 2>&1")
+
+            section("VPN PROCESS")
+            out += self.runShell("if [ -f /tmp/sstp-gui.pid ]; then PID=$(cat /tmp/sstp-gui.pid); ps -p \"$PID\" -o pid,ppid,user,etime,comm; else echo NONE; fi")
+
+            section("PPP INTERFACES")
+            out += self.runShell("/sbin/ifconfig | grep -A 12 '^ppp' || true")
+
+            section("INTERNET ROUTE 1.1.1.1")
+            appendCommand("/sbin/route", ["-n", "get", "1.1.1.1"])
+
+            section("INTERNET ICMP 1.1.1.1")
+            appendCommand("/sbin/ping", ["-c", "4", "1.1.1.1"])
+
+            section("INTERNET TCP 1.1.1.1:443")
+            appendCommand("/usr/bin/nc", ["-vz", "-G", "5", "1.1.1.1", "443"])
+
+            section("INTERNET TRACEROUTE 1.1.1.1")
+            appendTrace("1.1.1.1")
+
+            if !serverCopy.isEmpty {
+                section("VPN SERVER DNS")
+                appendHostResolution(serverCopy)
+
+                section("VPN SERVER ROUTE")
+                appendCommand("/sbin/route", ["-n", "get", serverCopy])
+
+                section("VPN SERVER ICMP")
+                appendCommand("/sbin/ping", ["-c", "4", serverCopy])
+
+                section("VPN SERVER TCP 443")
+                appendCommand("/usr/bin/nc", ["-vz", "-G", "5", serverCopy, "443"])
+
+                section("VPN SERVER TRACEROUTE")
+                appendTrace(serverCopy)
+            }
+
+            if !targetCopy.isEmpty {
+                section("DIAGNOSTIC TARGET")
+                out += "Host: \(targetCopy)\nTCP port: \(portCopy)\n"
+
+                section("TARGET DNS")
+                appendHostResolution(targetCopy)
+
+                section("TARGET ROUTE")
+                appendCommand("/sbin/route", ["-n", "get", targetCopy])
+
+                section("TARGET ICMP")
+                appendCommand("/sbin/ping", ["-c", "4", targetCopy])
+
+                section("TARGET TCP \(portCopy)")
+                appendCommand("/usr/bin/nc", ["-vz", "-G", "5", targetCopy, String(portCopy)])
+
+                section("TARGET TRACEROUTE")
+                appendTrace(targetCopy)
+            } else {
+                section("DIAGNOSTIC TARGET")
+                out += "NOT SET\n"
+            }
+
+            section("ROUTING TABLE")
+            out += self.runShell("/usr/sbin/netstat -rn -f inet | grep -E 'default|0/1|128.0/1|ppp|UGHS|UHW' || true")
+
+            section("ARP CACHE")
+            out += self.runShell("/usr/sbin/arp -an | head -n 80")
+
+            section("DNS")
+            out += self.runShell("/usr/sbin/scutil --dns | head -n 160")
+
+            section("APP RESULT")
+            out += self.runShell("cat /tmp/sstp-gui.result 2>/dev/null || echo NONE")
+
+            section("APP STATE")
+            out += self.runShell("cat /tmp/sstp-gui.state 2>/dev/null || echo NONE")
+
+            section("VPN LOG")
+            out += self.runShell("tail -n 80 /tmp/sstp-gui.log 2>/dev/null || echo 'No log'")
+
+            DispatchQueue.main.async {
+                self.diagnostics = out
+                self.diagnosticsRunning = false
+            }
         }
     }
 
@@ -376,6 +508,7 @@ struct ComponentRow: View {
     let ok: Bool
     let title: String
     let detail: String
+
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle.fill")
@@ -457,15 +590,44 @@ struct ContentView: View {
             .tabItem { Label("Setup", systemImage: "gearshape") }
 
             VStack(alignment: .leading, spacing: 12) {
-                Text("Diagnostics").font(.title2).bold()
+                Text("Extended Diagnostics").font(.title2).bold()
+
+                GroupBox("Target test") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Host / IP")
+                                .frame(width: 70, alignment: .trailing)
+                            TextField("10.0.0.10 or host.example.com", text: $vpn.diagnosticTarget)
+                            Button("Use VPN server") { vpn.useVPNServerAsDiagnosticTarget() }
+                        }
+                        HStack {
+                            Text("TCP port")
+                                .frame(width: 70, alignment: .trailing)
+                            TextField("443", text: $vpn.diagnosticPort)
+                                .frame(width: 90)
+                            Text("Target diagnostics include DNS, route, ping, TCP and traceroute.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                        }
+                    }
+                    .padding(4)
+                }
+
                 HStack {
-                    Button(vpn.diagnosticsRunning ? "Running..." : "Run diagnostics") { vpn.runDiagnostics() }.disabled(vpn.diagnosticsRunning)
+                    Button(vpn.diagnosticsRunning ? "Running..." : "Run extended diagnostics") { vpn.runDiagnostics() }
+                        .disabled(vpn.diagnosticsRunning)
                     Button("Copy") { vpn.copyDiagnostics() }.disabled(vpn.diagnostics.isEmpty)
                     Button("Repair network") { vpn.repairNetworking() }
                     Spacer()
                 }
+
+                Text("Traceroute uses up to 12 hops with one probe per hop. ICMP or traceroute may be filtered by a network even when TCP connectivity works.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
                 ScrollView {
-                    Text(vpn.diagnostics.isEmpty ? "Press Run diagnostics." : vpn.diagnostics)
+                    Text(vpn.diagnostics.isEmpty ? "Set an optional target and press Run extended diagnostics." : vpn.diagnostics)
                         .font(.system(size: 11, design: .monospaced))
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
@@ -474,7 +636,7 @@ struct ContentView: View {
             .padding(20)
             .tabItem { Label("Diagnostics", systemImage: "stethoscope") }
         }
-        .frame(width: 680, height: 520)
+        .frame(width: 760, height: 600)
     }
 }
 
