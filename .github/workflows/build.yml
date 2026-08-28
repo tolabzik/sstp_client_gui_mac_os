@@ -1,0 +1,33 @@
+name: Build macOS app
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Universal app
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Verify binary
+        run: |
+          lipo -archs "dist/SSTP Client GUI.app/Contents/MacOS/SSTPClientGUI"
+          codesign --verify --deep --strict "dist/SSTP Client GUI.app"
+
+      - name: Upload app archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSTP-Client-GUI-macOS
+          path: dist/SSTP-Client-GUI-macOS.zip
+          if-no-files-found: error
