@@ -12,13 +12,19 @@ TOOLS="$ROOT/Tools"
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 INSTALL_APP=0
 OPEN_APP=0
+INSTALL_ONLY=0
+BUILD_IN_PROGRESS=0
 
 usage() {
   cat <<'EOF'
 Usage:
-  ./build.sh                 Build Universal app + ZIP
+  ./build.sh                 Clean Universal build + ZIP
   ./build.sh --install       Clean build, replace /Applications copy and launch it
   ./build.sh --install-only  Install already-built dist app and launch it
+  ./build.sh --help          Show this help
+
+Optional signing:
+  SIGN_IDENTITY="Developer ID Application: Name (TEAMID)" ./build.sh --install
 EOF
 }
 
@@ -31,6 +37,7 @@ for arg in "$@"; do
     --install-only)
       INSTALL_APP=1
       OPEN_APP=1
+      INSTALL_ONLY=1
       ;;
     -h|--help)
       usage
@@ -44,16 +51,23 @@ for arg in "$@"; do
   esac
 done
 
-INSTALL_ONLY=0
-for arg in "$@"; do
-  [ "$arg" = "--install-only" ] && INSTALL_ONLY=1
-done
+cleanup_on_error() {
+  local rc=$?
+  if [ "$rc" -ne 0 ] && [ "$BUILD_IN_PROGRESS" -eq 1 ]; then
+    echo
+    echo "Build failed (exit $rc). Removing incomplete build output..."
+    rm -rf "$DIST" "$WORK"
+  fi
+  exit "$rc"
+}
+trap cleanup_on_error EXIT
 
 install_app() {
   local target="/Applications/SSTP Client GUI.app"
 
-  if [ ! -d "$APP" ]; then
-    echo "Build output not found: $APP"
+  if [ ! -d "$APP" ] || [ ! -x "$BIN" ]; then
+    echo "Complete build output not found: $APP"
+    echo "Run ./build.sh --install first."
     exit 1
   fi
 
@@ -66,8 +80,7 @@ install_app() {
   sudo /bin/rm -rf "$target"
   sudo /usr/bin/ditto "$APP" "$target"
 
-  # The app is ad-hoc signed unless SIGN_IDENTITY is supplied.
-  # Removing quarantine is useful for trusted internal builds copied locally.
+  # Local/internal builds are ad-hoc signed unless SIGN_IDENTITY is supplied.
   sudo /usr/bin/xattr -dr com.apple.quarantine "$target" >/dev/null 2>&1 || true
 
   echo "Verifying installed application..."
@@ -84,10 +97,14 @@ install_app() {
 
 if [ "$INSTALL_ONLY" -eq 1 ]; then
   install_app
+  trap - EXIT
   exit 0
 fi
 
-# Always start from a clean local build.
+BUILD_IN_PROGRESS=1
+
+# Always start from a clean local build. This also removes a partial .app left by
+# an interrupted/failed older build.
 rm -rf "$DIST" "$WORK"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$WORK"
 
@@ -97,14 +114,29 @@ if ! xcrun --find swiftc >/dev/null 2>&1; then
   exit 1
 fi
 
+SDK="$(xcrun --sdk macosx --show-sdk-path)"
+SWIFTC="$(xcrun --find swiftc)"
+
+echo "SDK: $SDK"
+echo "Swift compiler: $SWIFTC"
+
 cp "$RES/vpnctl.sh" "$APP/Contents/Resources/vpnctl.sh"
 cp "$RES/setup.sh" "$APP/Contents/Resources/setup.sh"
 chmod 755 "$APP/Contents/Resources/vpnctl.sh" "$APP/Contents/Resources/setup.sh"
 
-# Generate a native .icns file from source so the repository stays text-only.
+# Build the icon generator as a normal executable. Using `xcrun swift` here can
+# fail on Command Line Tools installations because the Swift JIT does not link
+# AppKit symbols (_NSImage, _NSColor, ...).
 echo "Generating app icon..."
-xcrun swift "$TOOLS/make_icon.swift" "$WORK/AppIcon.iconset"
-iconutil -c icns "$WORK/AppIcon.iconset" -o "$APP/Contents/Resources/AppIcon.icns"
+ICON_TOOL="$WORK/make_icon"
+"$SWIFTC" \
+  -sdk "$SDK" \
+  "$TOOLS/make_icon.swift" \
+  -o "$ICON_TOOL" \
+  -framework AppKit \
+  -framework Foundation
+"$ICON_TOOL" "$WORK/AppIcon.iconset"
+/usr/bin/iconutil -c icns "$WORK/AppIcon.iconset" -o "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -125,9 +157,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
   <key>CFBundleVersion</key>
-  <string>4</string>
+  <string>5</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.2.1</string>
+  <string>1.2.2</string>
   <key>LSMinimumSystemVersion</key>
   <string>12.0</string>
   <key>NSHighResolutionCapable</key>
@@ -136,10 +168,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-SDK="$(xcrun --sdk macosx --show-sdk-path)"
-
 echo "Building arm64..."
-xcrun swiftc \
+"$SWIFTC" \
   -parse-as-library \
   -swift-version 5 \
   -target arm64-apple-macos12.0 \
@@ -151,7 +181,7 @@ xcrun swiftc \
   -framework Security
 
 echo "Building x86_64..."
-xcrun swiftc \
+"$SWIFTC" \
   -parse-as-library \
   -swift-version 5 \
   -target x86_64-apple-macos12.0 \
@@ -162,24 +192,27 @@ xcrun swiftc \
   -framework AppKit \
   -framework Security
 
-lipo -create \
+/usr/bin/lipo -create \
   "$WORK/SSTPClientGUI-arm64" \
   "$WORK/SSTPClientGUI-x86_64" \
   -output "$BIN"
 
 chmod 755 "$BIN"
 
-plutil -lint "$APP/Contents/Info.plist"
+/usr/bin/plutil -lint "$APP/Contents/Info.plist"
 
 echo "Signing with: $SIGN_IDENTITY"
-codesign --force --deep --sign "$SIGN_IDENTITY" "$APP"
-codesign --verify --deep --strict "$APP"
+/usr/bin/codesign --force --deep --sign "$SIGN_IDENTITY" "$APP"
+/usr/bin/codesign --verify --deep --strict "$APP"
 
-echo "Architectures: $(lipo -archs "$BIN")"
+echo "Architectures: $(/usr/bin/lipo -archs "$BIN")"
+echo "Version: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
 
-ditto -c -k --sequesterRsrc --keepParent \
+/usr/bin/ditto -c -k --sequesterRsrc --keepParent \
   "$APP" \
   "$DIST/SSTP-Client-GUI-macOS.zip"
+
+BUILD_IN_PROGRESS=0
 
 echo
 echo "Build complete:"
@@ -189,3 +222,5 @@ echo "  $DIST/SSTP-Client-GUI-macOS.zip"
 if [ "$INSTALL_APP" -eq 1 ]; then
   install_app
 fi
+
+trap - EXIT
