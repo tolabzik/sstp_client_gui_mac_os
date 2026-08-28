@@ -8,6 +8,7 @@ APP="$DIST/SSTP Client GUI.app"
 BIN="$APP/Contents/MacOS/SSTPClientGUI"
 SRC="$ROOT/Sources/SSTPClientGUI.swift"
 RES="$ROOT/Resources"
+TOOLS="$ROOT/Tools"
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 
 rm -rf "$DIST" "$WORK"
@@ -22,6 +23,11 @@ fi
 cp "$RES/vpnctl.sh" "$APP/Contents/Resources/vpnctl.sh"
 cp "$RES/setup.sh" "$APP/Contents/Resources/setup.sh"
 chmod 755 "$APP/Contents/Resources/vpnctl.sh" "$APP/Contents/Resources/setup.sh"
+
+# Generate a native .icns file from source so the repository stays text-only.
+echo "Generating app icon..."
+xcrun swift "$TOOLS/make_icon.swift" "$WORK/AppIcon.iconset"
+iconutil -c icns "$WORK/AppIcon.iconset" -o "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -39,10 +45,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <string>io.github.tolabzik.sstp-client-gui</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleVersion</key>
-  <string>2</string>
+  <string>3</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.1.0</string>
+  <string>1.2.0</string>
   <key>LSMinimumSystemVersion</key>
   <string>12.0</string>
   <key>NSHighResolutionCapable</key>
