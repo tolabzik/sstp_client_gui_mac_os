@@ -94,6 +94,12 @@ probe_via_ppp() {
   return 1
 }
 
+conflicting_full_tunnel_routes() {
+  /usr/sbin/netstat -rn -f inet 2>/dev/null | /usr/bin/awk '
+    ($1 == "0/1" || $1 == "0.0.0.0/1" || $1 == "128.0/1" || $1 == "128.0.0.0/1") { print }
+  '
+}
+
 case "$ACTION" in
   repair|disconnect)
     cleanup_all
@@ -118,10 +124,15 @@ case "$ACTION" in
     cleanup_all
     sleep 1
 
-    # Do not stack our full tunnel on top of an already active PPP default route.
+    # Refuse to stack a full tunnel on top of another active or stale VPN route.
     BASE_IF="$(/sbin/route -n get 1.1.1.1 2>/dev/null | /usr/bin/awk '/interface:/{print $2; exit}')"
     if [ "$FULL_TUNNEL" = "1" ] && printf '%s' "$BASE_IF" | /usr/bin/grep -q '^ppp'; then
-      fail "Another PPP/VPN full tunnel is already active on $BASE_IF"
+      fail "Another PPP/VPN full tunnel is already active on $BASE_IF. Disconnect the other VPN first."
+    fi
+
+    CONFLICT_ROUTES="$(conflicting_full_tunnel_routes)"
+    if [ "$FULL_TUNNEL" = "1" ] && [ -n "$CONFLICT_ROUTES" ]; then
+      fail "Existing split-default VPN routes (0/1 or 128/1) were found. They may be leftovers from another VPN. Use Diagnostics to identify them or disconnect/repair the other VPN first."
     fi
 
     GW="$(/sbin/route -n get default 2>/dev/null | /usr/bin/awk '/gateway:/{print $2; exit}')"
