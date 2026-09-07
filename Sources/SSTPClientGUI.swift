@@ -161,16 +161,8 @@ final class VPNModel: ObservableObject {
         "'" + value.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
     }
 
-    private func appleEscape(_ value: String) -> String {
-        value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-    }
-
     private func runAdmin(_ command: String) -> String? {
-        let source = "do shell script \"" + appleEscape(command) + "\" with administrator privileges"
-        guard let script = NSAppleScript(source: source) else { return "Could not create AppleScript" }
-        var error: NSDictionary?
-        script.executeAndReturnError(&error)
-        return error?.description
+        AuthorizationSession.shared.runShell(command)
     }
 
     private func runAdminAsync(_ command: String, completion: @escaping (String?) -> Void) {
@@ -386,6 +378,25 @@ final class VPNModel: ObservableObject {
         runAdminAsync(command) { error in
             if let error { self.status = .error; self.message = error }
             else { self.status = .disconnected; self.message = "Network state cleaned" }
+            self.refreshStatus()
+            self.runNetworkAudit()
+        }
+    }
+
+    func emergencyRepair() {
+        guard let controller = controllerPath else { return }
+        let command = "/bin/bash \(shellQuote(controller)) purge \(shellQuote(server))"
+        status = .connecting
+        message = "Emergency cleanup: stopping stale SSTP/PPP helpers, routes and DNS state…"
+        runAdminAsync(command) { error in
+            if let error {
+                self.status = .error
+                self.message = error
+            } else {
+                self.status = .disconnected
+                self.message = "Emergency VPN cleanup completed"
+            }
+            self.refreshStatus()
             self.runNetworkAudit()
         }
     }
@@ -452,6 +463,7 @@ final class VPNModel: ObservableObject {
             section("VPN PROCESS"); out += self.runShell("if [ -f /tmp/sstp-gui.pid ]; then PID=$(cat /tmp/sstp-gui.pid); ps -p \"$PID\" -o pid,ppid,user,etime,comm; else echo NONE; fi")
             section("WATCHDOG"); out += self.runShell("if [ -f /tmp/sstp-gui-watchdog.pid ]; then echo PID=$(cat /tmp/sstp-gui-watchdog.pid); ps -p $(cat /tmp/sstp-gui-watchdog.pid) -o pid,ppid,user,etime,comm 2>/dev/null || true; else echo NONE; fi; tail -n 30 /tmp/sstp-gui-watchdog.log 2>/dev/null || true")
             section("PPP INTERFACES"); out += self.runShell("/sbin/ifconfig | grep -A 12 '^ppp' || true")
+            section("SSTP HELPER PROCESSES"); out += self.runShell("pgrep -lf 'sstpc|sstp-pppd' || echo NONE")
             section("VPN CONFLICT CHECK")
             out += self.runShell("echo 'PPP:'; /sbin/ifconfig -l | tr ' ' '\\n' | grep '^ppp[0-9]' || true; echo 'Split-default routes:'; /usr/sbin/netstat -rn -f inet | awk '$1==\"0/1\" || $1==\"0.0.0.0/1\" || $1==\"128.0/1\" || $1==\"128.0.0.0/1\" {print}'; echo 'Default path:'; /sbin/route -n get 1.1.1.1 2>&1 | grep -E 'gateway:|interface:'")
             section("INTERNET ROUTE 1.1.1.1"); appendCommand("/sbin/route", ["-n", "get", "1.1.1.1"])
@@ -484,6 +496,7 @@ final class VPNModel: ObservableObject {
             section("APP RESULT"); out += self.runShell("cat /tmp/sstp-gui.result 2>/dev/null || echo NONE")
             section("APP STATE"); out += self.runShell("cat /tmp/sstp-gui.state 2>/dev/null || echo NONE")
             section("VPN LOG"); out += self.runShell("tail -n 100 /tmp/sstp-gui.log 2>/dev/null || echo 'No log'")
+            section("EMERGENCY CLEANUP LOG"); out += self.runShell("tail -n 120 /tmp/sstp-gui-purge.log 2>/dev/null || echo NONE")
 
             DispatchQueue.main.async {
                 self.diagnostics = out
@@ -707,6 +720,9 @@ struct ContentView: View {
                                 Text("The root watchdog restores this app's Full Tunnel routes if sstpc exits unexpectedly.")
                                     .font(.caption2)
                                     .foregroundColor(.secondary)
+                                Text("Administrator authorization is requested on the first privileged action and reused for Connect / Disconnect / Repair while this app stays open.")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
                             }
                         }
 
@@ -794,8 +810,16 @@ struct ContentView: View {
 
                             Button("Repair this app") { vpn.repairNetworking() }
                                 .controlSize(.large)
+
+                            Button("Emergency repair") { vpn.emergencyRepair() }
+                                .tint(.red)
+                                .controlSize(.large)
                             Spacer()
                         }
+
+                        Text("Emergency repair is intentionally aggressive: it stops stale SSTP GUI / sstp-pppd helpers, removes their PPP split routes and refreshes DNS. It does not touch utun interfaces.")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
 
                         AppFooter(updater: updater)
                     }
@@ -850,7 +874,8 @@ struct ContentView: View {
                         Button("Copy") { vpn.copyDiagnostics() }.disabled(vpn.diagnostics.isEmpty)
                         Button("Save report…") { vpn.saveDiagnostics() }.disabled(vpn.diagnostics.isEmpty)
                         Button("Check VPN leftovers") { vpn.runNetworkAudit() }
-                        Button("Repair this app") { vpn.repairNetworking() }
+                        Button("Repair") { vpn.repairNetworking() }
+                        Button("Emergency repair") { vpn.emergencyRepair() }.tint(.red)
                         Spacer()
                     }
 
