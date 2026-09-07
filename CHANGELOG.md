@@ -2,6 +2,19 @@
 
 Все заметные изменения SSTP Client GUI фиксируются здесь.
 
+## 1.4.1 — 2026-09-08
+
+### Fixed
+
+- исправлена регрессия `1.4.0`, из-за которой привилегированный запуск VPN-контроллера через `AuthorizationExecuteWithPrivileges` мог не запускать корректную цепочку `sstpc -> pppd` на современных версиях macOS;
+- Connect / Disconnect / Repair / Emergency repair снова используют проверенный `do shell script ... with administrator privileges`, который запускает VPN-контроллер в нормальном root-контексте;
+- автообновление из `1.4.0` не затронуто и может установить `1.4.1` прямо из приложения.
+
+### Notes
+
+- оптимизация «один пароль администратора на всю сессию приложения» временно откатана ради надёжности VPN;
+- постоянные привилегии будут возвращены только через отдельный signed ServiceManagement privileged helper, а не через deprecated `AuthorizationExecuteWithPrivileges`.
+
 ## 1.4.0 — 2026-09-08
 
 ### Added
@@ -19,8 +32,8 @@
 
 ### Notes
 
-- Authorization Services хранит credentials в authorization session; фактический timeout всё равно определяется политикой macOS;
-- для полностью постоянного privileged helper без повторной авторизации между запусками приложения нужен signed ServiceManagement helper. Для macOS 13+ Apple рекомендует `SMAppService`; для поддержки macOS 12 используется `SMJobBless`. Это требует нормальной code-signing identity, поэтому ad-hoc public build пока использует session-cached Authorization Services.
+- этот механизм оказался ненадёжным для цепочки `sstpc -> pppd` и заменён обратно на стабильный privileged launch в `1.4.1`;
+- для полностью постоянного privileged helper без повторной авторизации между запусками приложения нужен signed ServiceManagement helper.
 
 ## 1.3.3 — 2026-09-08
 
