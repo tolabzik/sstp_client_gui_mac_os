@@ -2,6 +2,26 @@
 
 Все заметные изменения SSTP Client GUI фиксируются здесь.
 
+## 1.4.0 — 2026-09-08
+
+### Added
+
+- кнопка **Emergency repair** во вкладках Setup и Diagnostics;
+- аварийное восстановление запускает встроенный `purge`: завершает зависшие `sstpc` / `sstp-pppd.*`, очищает PPP split-default routes, временные файлы и DNS state;
+- диагностика теперь отдельно показывает SSTP helper-процессы и последние строки emergency cleanup log;
+- единая Authorization Services session для привилегированных операций.
+
+### Changed
+
+- Connect / Disconnect / Repair больше не создают отдельную macOS admin-auth session на каждое действие;
+- при первом привилегированном действии приложение запрашивает права администратора, затем переиспользует тот же authorization reference, пока приложение остаётся запущенным;
+- UI явно сообщает, что права переиспользуются в текущей сессии приложения.
+
+### Notes
+
+- Authorization Services хранит credentials в authorization session; фактический timeout всё равно определяется политикой macOS;
+- для полностью постоянного privileged helper без повторной авторизации между запусками приложения нужен signed ServiceManagement helper. Для macOS 13+ Apple рекомендует `SMAppService`; для поддержки macOS 12 используется `SMJobBless`. Это требует нормальной code-signing identity, поэтому ad-hoc public build пока использует session-cached Authorization Services.
+
 ## 1.3.3 — 2026-09-08
 
 ### Fixed
