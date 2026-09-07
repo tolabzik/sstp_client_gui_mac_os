@@ -78,8 +78,6 @@ install_app() {
   echo "Replacing application in /Applications..."
   sudo /bin/rm -rf "$target"
   sudo /usr/bin/ditto "$APP" "$target"
-
-  # Local/internal builds are ad-hoc signed unless SIGN_IDENTITY is supplied.
   sudo /usr/bin/xattr -dr com.apple.quarantine "$target" >/dev/null 2>&1 || true
 
   echo "Verifying installed application..."
@@ -120,9 +118,12 @@ echo "SDK: $SDK"
 echo "Swift compiler: $SWIFTC"
 echo "Swift sources: ${#SOURCES[@]}"
 
-cp "$RES/vpnctl.sh" "$APP/Contents/Resources/vpnctl.sh"
-cp "$RES/setup.sh" "$APP/Contents/Resources/setup.sh"
-chmod 755 "$APP/Contents/Resources/vpnctl.sh" "$APP/Contents/Resources/setup.sh"
+echo "Checking shell resources..."
+for script in "$RES"/*.sh; do
+  /bin/bash -n "$script"
+  cp "$script" "$APP/Contents/Resources/$(basename "$script")"
+  chmod 755 "$APP/Contents/Resources/$(basename "$script")"
+done
 
 echo "Generating app icon..."
 ICON_TOOL="$WORK/make_icon"
@@ -154,9 +155,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
   <key>CFBundleVersion</key>
-  <string>8</string>
+  <string>9</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.3.2</string>
+  <string>1.3.3</string>
   <key>LSMinimumSystemVersion</key>
   <string>12.0</string>
   <key>LSApplicationCategoryType</key>
