@@ -2,6 +2,29 @@
 
 Все заметные изменения SSTP Client GUI фиксируются здесь.
 
+## 1.3.3 — 2026-09-08
+
+### Fixed
+
+- исправлена утечка фоновых PPP helper-процессов, которые `sstp-client` запускает с аргументами вида `/tmp/sstp-pppd.*`;
+- `Disconnect`, `Repair this app`, rollback при ошибке и watchdog теперь отслеживают и завершают helper-процессы именно текущей SSTP-сессии;
+- при аварийном завершении `sstpc` helper PID и временные `sstp-pppd.*` больше не должны оставаться жить отдельно;
+- после cleanup сбрасывается DNS cache через `dscacheutil` и `mDNSResponder`;
+- `Repair this app` умеет удалять legacy orphan helpers от старых версий, если живого `sstpc` уже нет.
+
+### Added
+
+- `Resources/emergency_cleanup.sh` — аварийная очистка зависших SSTP/PPP процессов и сетевых остатков;
+- emergency cleanup делает `TERM`, затем `KILL` для зависших `sstpc`/`sstp-pppd.*`, удаляет temp/state files, stale split-default routes на PPP и обновляет DNS;
+- cleanup пишет подробный отчёт в `/tmp/sstp-gui-purge.log`;
+- build проверяет синтаксис всех shell resources через `bash -n` и включает все `Resources/*.sh` в `.app`.
+
+### Safety
+
+- штатный Disconnect по-прежнему убивает только helper PID, обнаруженные как созданные конкретной SSTP-сессией;
+- агрессивный `emergency_cleanup.sh` предназначен только для ручного восстановления сломанного состояния и может завершить другие активные `sstpc` sessions;
+- `utun` интерфейсы emergency cleanup не трогает.
+
 ## 1.3.2 — 2026-08-28
 
 ### Safety
