@@ -6,9 +6,10 @@ ACTION="${1:-}"
 SERVER="${2:-}"
 USER_NAME="${3:-}"
 SECRET_FILE="${4:-}"
-CERT_MODE="${5:-ignore}"
+CERT_MODE="${5:-verify}"
 CERT_FILE="${6:-}"
 FULL_TUNNEL="${7:-1}"
+PORT="${8-443}"
 
 LOG="/tmp/sstp-gui.log"
 PIDFILE="/tmp/sstp-gui.pid"
@@ -19,18 +20,36 @@ WATCHDOG_LOG="/tmp/sstp-gui-watchdog.log"
 STOPFILE="/tmp/sstp-gui.stop"
 HELPER_PIDFILE="/tmp/sstp-gui-helper.pids"
 HELPER_FILELIST="/tmp/sstp-gui-helper.files"
+SERVICEFILE="/tmp/sstp-gui-service.id"
 
 SSTPC=""
-if [ -x /opt/homebrew/sbin/sstpc ]; then
-  SSTPC="/opt/homebrew/sbin/sstpc"
-elif [ -x /usr/local/sbin/sstpc ]; then
-  SSTPC="/usr/local/sbin/sstpc"
-fi
+SSTPC_HAS_GUI_FIXES=0
 
 write_result() {
   printf '%s\n' "$1" > "$RESULT"
   chmod 0644 "$RESULT" 2>/dev/null || true
 }
+
+# Invalid input should not tear down an already connected session.
+reject_connect() {
+  [ -z "$SECRET_FILE" ] || /bin/rm -f "$SECRET_FILE"
+  write_result "FAIL|$1"
+  exit 0
+}
+
+CONFIG_HELPERS="$(cd "$(dirname "$0")" && pwd)/vpnctl_config.sh"
+if [ ! -f "$CONFIG_HELPERS" ]; then
+  reject_connect "vpnctl_config.sh is missing from the app bundle"
+fi
+. "$CONFIG_HELPERS"
+DNS_HELPERS="$(cd "$(dirname "$0")" && pwd)/vpnctl_dns.sh"
+if [ ! -f "$DNS_HELPERS" ]; then
+  reject_connect "vpnctl_dns.sh is missing from the app bundle"
+fi
+. "$DNS_HELPERS"
+if [ "$ACTION" = connect ]; then
+  select_sstpc || true
+fi
 
 read_state() {
   STATE_PPP=""
@@ -122,30 +141,54 @@ EOF_FILES
 
 kill_pid_gracefully() {
   TARGET_PID="$1"
+  WAIT_STEPS="${2:-10}"
   [ -n "$TARGET_PID" ] || return 0
   kill -0 "$TARGET_PID" >/dev/null 2>&1 || return 0
   kill -TERM "$TARGET_PID" >/dev/null 2>&1 || true
   I=0
-  while [ "$I" -lt 10 ] && kill -0 "$TARGET_PID" >/dev/null 2>&1; do
+  while [ "$I" -lt "$WAIT_STEPS" ] && kill -0 "$TARGET_PID" >/dev/null 2>&1; do
     sleep 0.2
     I=$((I + 1))
   done
   if kill -0 "$TARGET_PID" >/dev/null 2>&1; then
     kill -KILL "$TARGET_PID" >/dev/null 2>&1 || true
+    I=0
+    while [ "$I" -lt 10 ] && kill -0 "$TARGET_PID" >/dev/null 2>&1; do
+      sleep 0.2
+      I=$((I + 1))
+    done
   fi
+  ! kill -0 "$TARGET_PID" >/dev/null 2>&1
 }
 
 kill_owned_helpers() {
-  [ -f "$HELPER_PIDFILE" ] || return 0
-  while IFS= read -r HPID; do
-    case "$HPID" in
-      ''|*[!0-9]*) continue ;;
-    esac
-    CMD="$(/bin/ps -p "$HPID" -o command= 2>/dev/null || true)"
-    if printf '%s' "$CMD" | /usr/bin/grep -Eq '/tmp/+sstp-pppd\.'; then
-      kill_pid_gracefully "$HPID"
-    fi
-  done < "$HELPER_PIDFILE"
+  local owned_id
+  if [ -f "$HELPER_PIDFILE" ]; then
+    while IFS= read -r HPID; do
+      case "$HPID" in
+        ''|*[!0-9]*) continue ;;
+      esac
+      CMD="$(/bin/ps -p "$HPID" -o command= 2>/dev/null || true)"
+      if printf '%s' "$CMD" | /usr/bin/grep -Eq '/tmp/+sstp-pppd\.'; then
+        # Let pppd complete LCP termination and unpublish DNS before escalation.
+        kill_pid_gracefully "$HPID" 50
+      fi
+    done < "$HELPER_PIDFILE"
+  fi
+  # Also find the explicitly named session if pppd daemonized between PID
+  # snapshots or a previous failed cleanup retained only its service record.
+  if service_file_is_owned; then
+    owned_id="$(cat "$SERVICEFILE" 2>/dev/null)"
+    valid_sstp_service_id "$owned_id" || return 0
+    for HPID in $(service_pppd_pids "$owned_id"); do
+      # sstpc also carries the forwarded serviceid arguments. Only pppd has
+      # the generated options-file argument; keep its transport until later.
+      CMD="$(/bin/ps -p "$HPID" -o command= 2>/dev/null || true)"
+      if printf '%s' "$CMD" | /usr/bin/grep -Eq '/tmp/+sstp-pppd\.'; then
+        kill_pid_gracefully "$HPID" 50
+      fi
+    done
+  fi
 }
 
 cleanup_tracked_temp_files() {
@@ -233,17 +276,23 @@ delete_owned_routes() {
 cleanup_all() {
   stop_watchdog
   delete_owned_routes
-  kill_owned_client
-  sleep 0.2
+  # Keep the SSTP transport available while pppd closes LCP gracefully.
   kill_owned_helpers
+  kill_owned_client
   cleanup_tracked_temp_files
+  if ! cleanup_owned_service; then
+    # Preserve PID/interface ownership for a later Repair attempt.
+    flush_dns_cache
+    return 1
+  fi
   /bin/rm -f "$PIDFILE" "$STATEFILE" "$HELPER_PIDFILE" "$HELPER_FILELIST"
   flush_dns_cache
+  return 0
 }
 
 fail() {
   MSG="$1"
-  cleanup_all
+  cleanup_all || true
   kill_orphan_sstp_helpers
   flush_dns_cache
   write_result "FAIL|$MSG"
@@ -294,6 +343,8 @@ watchdog_cleanup_after_crash() {
   cleanup_test_routes
   kill_owned_helpers
   cleanup_tracked_temp_files
+  DNS_CLEANUP_OK=1
+  cleanup_owned_service || DNS_CLEANUP_OK=0
   if [ -n "$STATE_SERVER" ] && [ -n "$STATE_GW" ] && [ -n "$STATE_PHY" ]; then
     CURRENT_GW="$(route_gateway "$STATE_SERVER")"
     CURRENT_IF="$(route_interface "$STATE_SERVER")"
@@ -301,10 +352,17 @@ watchdog_cleanup_after_crash() {
       /sbin/route -n delete -host "$STATE_SERVER" "$STATE_GW" >/dev/null 2>&1 || true
     fi
   fi
-  /bin/rm -f "$PIDFILE" "$STATEFILE" "$WATCHDOG_PIDFILE" "$HELPER_PIDFILE" "$HELPER_FILELIST"
+  /bin/rm -f "$WATCHDOG_PIDFILE"
+  if [ "$DNS_CLEANUP_OK" = 1 ]; then
+    /bin/rm -f "$PIDFILE" "$STATEFILE" "$HELPER_PIDFILE" "$HELPER_FILELIST"
+  fi
   kill_orphan_sstp_helpers
   flush_dns_cache
-  write_result "FAIL|VPN disconnected unexpectedly; SSTP/PPP helpers and routing were cleaned automatically"
+  if [ "$DNS_CLEANUP_OK" = 1 ]; then
+    write_result "FAIL|VPN disconnected unexpectedly; SSTP/PPP helpers, DNS and routing were cleaned automatically"
+  else
+    write_result "FAIL|VPN disconnected unexpectedly; PPP DNS cleanup is incomplete and ownership was retained for Repair"
+  fi
 }
 
 case "$ACTION" in
@@ -329,7 +387,10 @@ case "$ACTION" in
     ;;
 
   repair)
-    cleanup_all
+    if ! cleanup_all; then
+      write_result "FAIL|PPP DNS cleanup is incomplete; the session ownership record was retained for Repair"
+      exit 0
+    fi
     kill_orphan_sstp_helpers
     /bin/rm -f "$STOPFILE"
     flush_dns_cache
@@ -338,13 +399,25 @@ case "$ACTION" in
     ;;
 
   disconnect)
-    cleanup_all
+    if ! cleanup_all; then
+      write_result "FAIL|PPP DNS cleanup is incomplete; the session ownership record was retained for Repair"
+      exit 0
+    fi
     /bin/rm -f "$STOPFILE"
     write_result "OFF|Disconnected"
     exit 0
     ;;
 
   purge)
+    if [ -n "$SERVER" ]; then
+      if parse_server_endpoint "$SERVER" "$PORT"; then
+        SERVER="$SERVER_HOST"
+      else
+        # Emergency cleanup must still work if the editable profile is invalid.
+        # The cleaner accepts an empty host and still repairs owned VPN state.
+        SERVER=""
+      fi
+    fi
     CLEANER="$(cd "$(dirname "$0")" && pwd)/emergency_cleanup.sh"
     if [ -f "$CLEANER" ]; then
       /bin/bash "$CLEANER" "$SERVER"
@@ -361,18 +434,27 @@ case "$ACTION" in
     ;;
 
   connect)
-    [ -n "$SERVER" ] || fail "Server is empty"
-    [ -n "$USER_NAME" ] || fail "Username is empty"
-    [ -n "$SSTPC" ] || fail "sstpc was not found"
-    [ -f "$SECRET_FILE" ] || fail "Password handoff file was not found"
-    PASSWORD="$(cat "$SECRET_FILE")"
+    parse_server_endpoint "$SERVER" "$PORT" || reject_connect "$CONFIG_ERROR"
+    [ -n "$USER_NAME" ] || reject_connect "Username is empty"
+    [ -n "$SSTPC" ] || reject_connect "sstpc was not found"
+    resolve_certificate "$CERT_MODE" "$CERT_FILE" "$SSTPC_HAS_GUI_FIXES" || reject_connect "$CONFIG_ERROR"
+    CERT_FILE="$RESOLVED_CERT_FILE"
+    read_sstpc_password "$SECRET_FILE" "$SSTPC_HAS_GUI_FIXES" || reject_connect "$CONFIG_ERROR"
     /bin/rm -f "$SECRET_FILE"
-    [ -n "$PASSWORD" ] || fail "Password is empty"
-    if [ "$CERT_MODE" = "verify" ] && [ ! -f "$CERT_FILE" ]; then
-      fail "Certificate file was not found"
+
+    SSTPC_ARGS=(--log-stderr --log-level 4)
+    # The patched client normalizes host:port for SNI on this connection.
+    # Stock versions can send the port as part of the TLS server name.
+    if [ "$SSTPC_HAS_GUI_FIXES" = 1 ]; then
+      SSTPC_ARGS+=(--tls-ext)
+    fi
+    if [ "$CERT_MODE" = verify ]; then
+      SSTPC_ARGS+=(--ca-cert "$CERT_FILE")
+    else
+      SSTPC_ARGS+=(--cert-warn)
     fi
 
-    cleanup_all
+    cleanup_all || fail "Previous PPP DNS state could not be cleaned safely; run Repair before reconnecting"
     kill_orphan_sstp_helpers
     /bin/rm -f "$STOPFILE"
     sleep 0.5
@@ -389,12 +471,12 @@ case "$ACTION" in
     GW="$(/sbin/route -n get default 2>/dev/null | /usr/bin/awk '/gateway:/{print $2; exit}')"
     PHY="$(/sbin/route -n get default 2>/dev/null | /usr/bin/awk '/interface:/{print $2; exit}')"
     [ -n "$GW" ] && [ -n "$PHY" ] || fail "Physical default gateway was not found"
-    /sbin/route -n delete -host "$SERVER" >/dev/null 2>&1 || true
-    /sbin/route -n add -host "$SERVER" "$GW" >/dev/null 2>&1 || fail "Could not pin VPN server route"
-    SERVER_IF="$(/sbin/route -n get "$SERVER" 2>/dev/null | /usr/bin/awk '/interface:/{print $2; exit}')"
+    /sbin/route -n delete -host "$SERVER_HOST" >/dev/null 2>&1 || true
+    /sbin/route -n add -host "$SERVER_HOST" "$GW" >/dev/null 2>&1 || fail "Could not pin VPN server route"
+    SERVER_IF="$(/sbin/route -n get "$SERVER_HOST" 2>/dev/null | /usr/bin/awk '/interface:/{print $2; exit}')"
     [ "$SERVER_IF" = "$PHY" ] || fail "VPN server route points to unexpected interface $SERVER_IF"
 
-    printf '|%s|%s|%s\n' "$PHY" "$GW" "$SERVER" > "$STATEFILE"
+    printf '|%s|%s|%s\n' "$PHY" "$GW" "$SERVER_HOST" > "$STATEFILE"
     chmod 0644 "$STATEFILE" 2>/dev/null || true
 
     PPP_BEFORE="$(list_ppp)"
@@ -406,15 +488,11 @@ case "$ACTION" in
     : > "$HELPER_FILELIST"
     chmod 0644 "$LOG" "$HELPER_PIDFILE" "$HELPER_FILELIST" 2>/dev/null || true
 
-    if [ "$CERT_MODE" = "verify" ]; then
-      "$SSTPC" --log-stderr --log-level 4 --ca-cert "$CERT_FILE" \
-        --user "$USER_NAME" --password "$PASSWORD" "$SERVER" \
-        usepeerdns require-mschap-v2 noauth >"$LOG" 2>&1 </dev/null &
-    else
-      "$SSTPC" --log-stderr --log-level 4 --cert-warn \
-        --user "$USER_NAME" --password "$PASSWORD" "$SERVER" \
-        usepeerdns require-mschap-v2 noauth >"$LOG" 2>&1 </dev/null &
-    fi
+    create_owned_service_id || fail "Could not reserve an owned PPP service ID; run Repair before reconnecting"
+
+    "$SSTPC" "${SSTPC_ARGS[@]}" \
+      --user "$USER_NAME" --password "$PASSWORD" "$SSTP_TARGET" \
+      usepeerdns require-mschap-v2 noauth serviceid "$SERVICE_ID" >"$LOG" 2>&1 </dev/null &
 
     SSTP_PID=$!
     unset PASSWORD
@@ -440,7 +518,7 @@ case "$ACTION" in
 
     capture_session_helpers "$HELPER_PIDS_BEFORE" "$HELPER_FILES_BEFORE"
     [ -n "$PPP" ] || fail "SSTP connected, but no new PPP interface appeared"
-    printf '%s|%s|%s|%s\n' "$PPP" "$PHY" "$GW" "$SERVER" > "$STATEFILE"
+    printf '%s|%s|%s|%s\n' "$PPP" "$PHY" "$GW" "$SERVER_HOST" > "$STATEFILE"
     chmod 0644 "$STATEFILE" 2>/dev/null || true
 
     if ! probe_via_ppp "$PPP"; then
@@ -451,7 +529,7 @@ case "$ACTION" in
       /sbin/route -n add -net 128.0.0.0/1 -interface "$PPP" >/dev/null 2>&1 || fail "Could not add 128.0.0.0/1"
       INTERNET_IF="$(/sbin/route -n get 1.1.1.1 2>/dev/null | /usr/bin/awk '/interface:/{print $2; exit}')"
       [ "$INTERNET_IF" = "$PPP" ] || fail "Full tunnel did not become active"
-      SERVER_IF="$(/sbin/route -n get "$SERVER" 2>/dev/null | /usr/bin/awk '/interface:/{print $2; exit}')"
+      SERVER_IF="$(/sbin/route -n get "$SERVER_HOST" 2>/dev/null | /usr/bin/awk '/interface:/{print $2; exit}')"
       [ "$SERVER_IF" != "$PPP" ] || fail "VPN server was routed into its own tunnel"
       if ! /usr/bin/nc -z -G 5 1.1.1.1 443 >/dev/null 2>&1; then
         fail "Internet is unavailable after enabling full tunnel"
@@ -460,7 +538,7 @@ case "$ACTION" in
 
     write_result "OK|$PPP|$PHY|$GW"
     /bin/rm -f "$STOPFILE"
-    /bin/bash "$0" watchdog "$SERVER" >"$WATCHDOG_LOG" 2>&1 </dev/null &
+    /bin/bash "$0" watchdog "$SERVER_HOST" >"$WATCHDOG_LOG" 2>&1 </dev/null &
     WD_PID=$!
     printf '%s\n' "$WD_PID" > "$WATCHDOG_PIDFILE"
     chmod 0644 "$WATCHDOG_PIDFILE" "$WATCHDOG_LOG" 2>/dev/null || true

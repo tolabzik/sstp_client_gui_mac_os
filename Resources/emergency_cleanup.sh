@@ -4,6 +4,8 @@ umask 077
 
 SERVER="${1:-}"
 LOG="/tmp/sstp-gui-purge.log"
+SERVICEFILE="/tmp/sstp-gui-service.id"
+DNS_HELPERS="$(cd "$(dirname "$0")" && pwd)/vpnctl_dns.sh"
 
 if [ "$(/usr/bin/id -u)" -ne 0 ]; then
   echo "Run as root: sudo bash $0 [vpn-server]" >&2
@@ -19,7 +21,10 @@ echo "=== SSTP Client GUI emergency cleanup ==="
 
 echo
 echo "--- Before: SSTP related processes ---"
-/bin/ps ax -o pid=,ppid=,user=,command= | /usr/bin/grep -E 'sstpc|sstp-pppd\.|sstp-gui.*watchdog' | /usr/bin/grep -v grep || true
+# Arguments can contain the VPN password; log only process IDs and names.
+for PID in $(/usr/bin/pgrep -f 'sstpc|sstp-pppd\.|sstp-gui.*watchdog' 2>/dev/null || true); do
+  /bin/ps -p "$PID" -o pid=,ppid=,user=,comm= 2>/dev/null || true
+done
 
 PPP_BEFORE="$(/sbin/ifconfig -l | /usr/bin/tr ' ' '\n' | /usr/bin/grep '^ppp[0-9]' 2>/dev/null || true)"
 echo
@@ -46,7 +51,7 @@ for PID in $(/usr/bin/pgrep -f '/tmp/+sstp-pppd\.' 2>/dev/null || true); do PIDS
 UNIQUE_PIDS="$(printf '%s\n' $PIDS 2>/dev/null | /usr/bin/awk '/^[0-9]+$/ && !seen[$1]++ {print $1}')"
 for PID in $UNIQUE_PIDS; do
   [ "$PID" -eq "$$" ] && continue
-  CMD="$(/bin/ps -p "$PID" -o command= 2>/dev/null || true)"
+  CMD="$(/bin/ps -p "$PID" -o comm= 2>/dev/null || true)"
   echo "TERM $PID $CMD"
   /bin/kill -TERM "$PID" >/dev/null 2>&1 || true
 done
@@ -55,7 +60,7 @@ sleep 1
 for PID in $UNIQUE_PIDS; do
   [ "$PID" -eq "$$" ] && continue
   if /bin/kill -0 "$PID" >/dev/null 2>&1; then
-    CMD="$(/bin/ps -p "$PID" -o command= 2>/dev/null || true)"
+    CMD="$(/bin/ps -p "$PID" -o comm= 2>/dev/null || true)"
     echo "KILL $PID $CMD"
     /bin/kill -KILL "$PID" >/dev/null 2>&1 || true
   fi
@@ -110,13 +115,20 @@ done
 
 echo
 echo "--- Refreshing DNS resolver cache ---"
+DNS_CLEANUP_OK=1
+if [ -f "$DNS_HELPERS" ]; then
+  . "$DNS_HELPERS"
+  cleanup_owned_service || DNS_CLEANUP_OK=0
+elif [ -e "$SERVICEFILE" ] || [ -L "$SERVICEFILE" ]; then
+  DNS_CLEANUP_OK=0
+fi
 /usr/bin/dscacheutil -flushcache >/dev/null 2>&1 || true
 /usr/bin/killall -HUP mDNSResponder >/dev/null 2>&1 || true
 sleep 1
 
 echo
 echo "--- After: SSTP helper processes ---"
-LEFT_HELPERS="$(/usr/bin/pgrep -lf '/tmp/+sstp-pppd\.' 2>/dev/null || true)"
+LEFT_HELPERS="$(/usr/bin/pgrep -f '/tmp/+sstp-pppd\.' 2>/dev/null || true)"
 printf '%s\n' "${LEFT_HELPERS:-NONE}"
 
 echo
@@ -137,6 +149,12 @@ printf '%s\n' "${PPP_DNS:-NONE}"
 if [ -n "$LEFT_HELPERS" ]; then
   echo
   echo "ERROR: SSTP helper processes are still alive"
+  exit 2
+fi
+
+if [ "$DNS_CLEANUP_OK" != 1 ]; then
+  echo
+  echo "ERROR: Owned PPP DNS cleanup is incomplete; the ownership record was retained"
   exit 2
 fi
 

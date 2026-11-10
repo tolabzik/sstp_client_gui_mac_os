@@ -1,0 +1,3 @@
+# Unified patches preserve whitespace in upstream context and removed lines.
+Patches/*.patch whitespace=-blank-at-eol
+Formula/sstp-client-gui.rb whitespace=-blank-at-eol
