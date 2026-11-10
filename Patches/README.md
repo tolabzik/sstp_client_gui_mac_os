@@ -28,14 +28,16 @@ in a temporary directory, then tests the actual modified C functions. It needs
 Python 3, a C compiler and OpenSSL 3 (`OPENSSL_PREFIX` can override its location).
 An existing archive can be supplied as the first argument for offline use.
 It does not connect to a VPN or modify routes. TLS handshakes use memory BIOs.
-CI also builds and tests the Homebrew formula from the PR checkout.
+CI also builds and tests the Homebrew formula from the current checkout.
 
-Before release, validate a real SSTP/PPP session with a quoted/backslash password,
-custom port, correct/wrong certificate names, disconnect and watchdog cleanup.
+Two live connect/disconnect cycles passed, including traffic and DNS/route cleanup.
+Dedicated live tests for quoted/backslash passwords, a nonstandard server port,
+verified TLS and watchdog cleanup remain in [issue #3](https://github.com/tolabzik/sstp_client_gui_mac_os/issues/3),
+along with investigation of one intermittent Full Tunnel route-check failure.
 
-## Test the formula before merge
+## Test a development checkout
 
-Use a checkout of this PR as the tap source (replace the path below):
+For dependency development, use a local checkout as the tap source (replace the path below):
 
 ```bash
 brew tap --custom-remote tolabzik/sstp-client-gui /absolute/path/to/sstp_client_gui_mac_os
@@ -43,7 +45,7 @@ brew install tolabzik/sstp-client-gui/sstp-client-gui
 brew test tolabzik/sstp-client-gui/sstp-client-gui
 ```
 
-After the changes reach main, switch the tap to its normal remote:
+After testing, switch the tap back to its normal remote:
 
 ```bash
 brew tap --custom-remote tolabzik/sstp-client-gui https://github.com/tolabzik/sstp_client_gui_mac_os.git

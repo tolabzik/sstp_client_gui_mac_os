@@ -90,6 +90,11 @@ jobs:
           shasum -a 256 \
              "dist/SSTP-Client-GUI-macOS-v${{ steps.version.outputs.version }}.zip" \
              > "dist/SSTP-Client-GUI-macOS-v${{ steps.version.outputs.version }}.zip.sha256"
+          awk -v version="${{ steps.version.outputs.version }}" '
+            $1 == "##" { if (capture) exit; capture = ($2 == version); next }
+            capture { print }
+          ' CHANGELOG.md > dist/RELEASE_NOTES.md
+          test -s dist/RELEASE_NOTES.md
 
       - name: Upload Actions artifact
         uses: actions/upload-artifact@v4
@@ -99,6 +104,12 @@ jobs:
             dist/SSTP-Client-GUI-macOS-v${{ steps.version.outputs.version }}.zip
             dist/SSTP-Client-GUI-macOS-v${{ steps.version.outputs.version }}.zip.sha256
           if-no-files-found: error
+
+      - name: Download tested SSTP component
+        uses: actions/download-artifact@v4
+        with:
+          name: sstp-client-gui-bottle-arm64
+          path: dist/sstp-component
 
       - name: Publish GitHub Release
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -110,6 +121,8 @@ jobs:
         run: |
           ZIP="dist/SSTP-Client-GUI-macOS-v${VERSION}.zip"
           SHA="${ZIP}.sha256"
+          (cd dist/sstp-component && shasum -a 256 -c SHA256SUMS)
+          mv dist/sstp-component/SHA256SUMS dist/sstp-component/sstp-client-gui-bottle-SHA256SUMS
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists. Nothing to publish."
@@ -120,8 +133,9 @@ jobs:
           gh release create "$TAG" \
             "$ZIP#SSTP Client GUI macOS Universal (Intel + Apple Silicon)" \
             "$SHA#SHA-256 checksum" \
+            dist/sstp-component/* \
             --target "$GITHUB_SHA" \
             --title "SSTP Client GUI $TAG" \
-            --generate-notes
+            --notes-file dist/RELEASE_NOTES.md
 
           echo "Published release $TAG"

@@ -155,9 +155,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIconFile</key>
   <string>AppIcon</string>
   <key>CFBundleVersion</key>
-  <string>11</string>
+  <string>12</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.4.1</string>
+  <string>1.5.0</string>
   <key>LSMinimumSystemVersion</key>
   <string>12.0</string>
   <key>LSApplicationCategoryType</key>
