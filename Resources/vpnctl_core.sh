@@ -22,11 +22,7 @@ HELPER_PIDFILE="/tmp/sstp-gui-helper.pids"
 HELPER_FILELIST="/tmp/sstp-gui-helper.files"
 
 SSTPC=""
-if [ -x /opt/homebrew/sbin/sstpc ]; then
-  SSTPC="/opt/homebrew/sbin/sstpc"
-elif [ -x /usr/local/sbin/sstpc ]; then
-  SSTPC="/usr/local/sbin/sstpc"
-fi
+SSTPC_HAS_GUI_FIXES=0
 
 write_result() {
   printf '%s\n' "$1" > "$RESULT"
@@ -45,6 +41,9 @@ if [ ! -f "$CONFIG_HELPERS" ]; then
   reject_connect "vpnctl_config.sh is missing from the app bundle"
 fi
 . "$CONFIG_HELPERS"
+if [ "$ACTION" = connect ]; then
+  select_sstpc || true
+fi
 
 read_state() {
   STATE_PPP=""
@@ -387,10 +386,22 @@ case "$ACTION" in
     parse_server_endpoint "$SERVER" "$PORT" || reject_connect "$CONFIG_ERROR"
     [ -n "$USER_NAME" ] || reject_connect "Username is empty"
     [ -n "$SSTPC" ] || reject_connect "sstpc was not found"
-    resolve_certificate "$CERT_MODE" "$CERT_FILE" || reject_connect "$CONFIG_ERROR"
+    resolve_certificate "$CERT_MODE" "$CERT_FILE" "$SSTPC_HAS_GUI_FIXES" || reject_connect "$CONFIG_ERROR"
     CERT_FILE="$RESOLVED_CERT_FILE"
-    read_sstpc_password "$SECRET_FILE" || reject_connect "$CONFIG_ERROR"
+    read_sstpc_password "$SECRET_FILE" "$SSTPC_HAS_GUI_FIXES" || reject_connect "$CONFIG_ERROR"
     /bin/rm -f "$SECRET_FILE"
+
+    SSTPC_ARGS=(--log-stderr --log-level 4)
+    # The patched client normalizes host:port for SNI on this connection.
+    # Stock versions can send the port as part of the TLS server name.
+    if [ "$SSTPC_HAS_GUI_FIXES" = 1 ]; then
+      SSTPC_ARGS+=(--tls-ext)
+    fi
+    if [ "$CERT_MODE" = verify ]; then
+      SSTPC_ARGS+=(--ca-cert "$CERT_FILE")
+    else
+      SSTPC_ARGS+=(--cert-warn)
+    fi
 
     cleanup_all
     kill_orphan_sstp_helpers
@@ -426,15 +437,9 @@ case "$ACTION" in
     : > "$HELPER_FILELIST"
     chmod 0644 "$LOG" "$HELPER_PIDFILE" "$HELPER_FILELIST" 2>/dev/null || true
 
-    if [ "$CERT_MODE" = "verify" ]; then
-      "$SSTPC" --log-stderr --log-level 4 --ca-cert "$CERT_FILE" \
-        --user "$USER_NAME" --password "$PASSWORD" "$SSTP_TARGET" \
-        usepeerdns require-mschap-v2 noauth >"$LOG" 2>&1 </dev/null &
-    else
-      "$SSTPC" --log-stderr --log-level 4 --cert-warn \
-        --user "$USER_NAME" --password "$PASSWORD" "$SSTP_TARGET" \
-        usepeerdns require-mschap-v2 noauth >"$LOG" 2>&1 </dev/null &
-    fi
+    "$SSTPC" "${SSTPC_ARGS[@]}" \
+      --user "$USER_NAME" --password "$PASSWORD" "$SSTP_TARGET" \
+      usepeerdns require-mschap-v2 noauth >"$LOG" 2>&1 </dev/null &
 
     SSTP_PID=$!
     unset PASSWORD

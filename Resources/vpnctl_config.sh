@@ -1,6 +1,38 @@
 #!/bin/bash
 # Pure configuration helpers. Sourcing this file does not change the network.
 
+sstpc_has_gui_fixes() {
+  local version
+  version="$("$1" --version 2>&1)" || return 1
+  printf '%s\n' "$version" | /usr/bin/grep -Eq '(^|[[:space:]])sstp-gui-fixes-1([[:space:]]|$)'
+}
+
+select_sstpc() {
+  # The first two entries are private, keg-only installations. Never use an
+  # unmarked binary from those paths; fall back to the user's stock dependency.
+  if [ "$#" -eq 0 ]; then
+    set -- /opt/homebrew/opt/sstp-client-gui/sbin/sstpc /usr/local/opt/sstp-client-gui/sbin/sstpc \
+      /opt/homebrew/sbin/sstpc /usr/local/sbin/sstpc
+  fi
+  local candidate index=0
+  SSTPC=""
+  SSTPC_HAS_GUI_FIXES=0
+  for candidate in "$@"; do
+    index=$((index + 1))
+    [ -x "$candidate" ] || continue
+    if sstpc_has_gui_fixes "$candidate"; then
+      SSTPC="$candidate"
+      SSTPC_HAS_GUI_FIXES=1
+      return 0
+    fi
+    if [ "$index" -gt 2 ]; then
+      SSTPC="$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 trim_config_value() {
   local value="$1"
   local LC_ALL=C
@@ -48,7 +80,7 @@ parse_server_endpoint() {
       return 1
     fi
     for octet in "${octets[@]}"; do
-      if [ -z "$octet" ] || [ "${#octet}" -gt 3 ] || [ "$((10#$octet))" -gt 255 ]; then
+      if [ -z "$octet" ] || [ "${#octet}" -gt 3 ] || [[ "$octet" == 0?* ]] || [ "$((10#$octet))" -gt 255 ]; then
         CONFIG_ERROR="Invalid IPv4 VPN server address"
         return 1
       fi
@@ -74,18 +106,21 @@ parse_server_endpoint() {
 }
 
 resolve_certificate() {
-  local mode="$1" file="$2"
+  local mode="$1" file="$2" has_gui_fixes="${3:-0}"
   CONFIG_ERROR=""
   RESOLVED_CERT_FILE=""
   case "$mode" in
     ignore) return 0 ;;
     verify)
-      # Stock sstp-client does not combine certificate-chain and hostname
-      # verification when --ca-cert is supplied. Do not silently broaden trust
-      # to the system CA bundle until that dependency behavior is corrected.
       if [ -z "$file" ]; then
-        CONFIG_ERROR="Select an explicit CA/server certificate file. Automatic public CA trust requires a hostname-verification fix in sstp-client."
-        return 1
+        if [ "$has_gui_fixes" = 1 ]; then
+          file=/etc/ssl/cert.pem
+        else
+          # Stock sstp-client replaces hostname checking with chain checking
+          # when --ca-cert is supplied. Broad public trust needs both checks.
+          CONFIG_ERROR="Select an explicit CA/server certificate file or install the GUI's updated components for automatic public CA verification."
+          return 1
+        fi
       fi
       if [ ! -f "$file" ] || [ ! -r "$file" ]; then
         CONFIG_ERROR="CA certificate file was not found or is not readable: $file"
@@ -102,7 +137,7 @@ validate_sstpc_password() {
   # escaping. Escaping --password here would change its MPPE key derivation.
   # Fail before the dependency can corrupt the secret or print a fragment.
   # Its 255-byte output buffer also needs 12 bytes of syntax plus the NUL.
-  local password="$1"
+  local password="$1" has_gui_fixes="${2:-0}" max_bytes=242
   local LC_ALL=C
   CONFIG_ERROR=""
   if [ -z "$password" ]; then
@@ -110,19 +145,30 @@ validate_sstpc_password() {
     return 1
   fi
   case "$password" in
-    *'"'*|*'\'*|*$'\r'*|*$'\n'*)
-      CONFIG_ERROR="The installed sstp-client cannot safely handle passwords containing quotes, backslashes or line breaks. A dependency fix is required."
+    *$'\r'*|*$'\n'*)
+      CONFIG_ERROR="Passwords containing line breaks are not supported"
       return 1
       ;;
   esac
-  if [ "${#password}" -gt 242 ]; then
-    CONFIG_ERROR="The installed sstp-client cannot safely handle passwords longer than 242 bytes. A dependency fix is required."
+  if [ "$has_gui_fixes" = 1 ]; then
+    # macOS pppd stores a password in a 256-byte buffer including its NUL.
+    max_bytes=255
+  else
+    case "$password" in
+      *'"'*|*'\'*)
+        CONFIG_ERROR="The installed sstp-client cannot safely handle passwords containing quotes or backslashes. Install the GUI's updated components."
+        return 1
+        ;;
+    esac
+  fi
+  if [ "${#password}" -gt "$max_bytes" ]; then
+    CONFIG_ERROR="The selected sstp-client supports passwords up to $max_bytes bytes"
     return 1
   fi
 }
 
 read_sstpc_password() {
-  local file="$1" bytes
+  local file="$1" has_gui_fixes="${2:-0}" bytes
   local LC_ALL=C
   CONFIG_ERROR=""
   PASSWORD=""
@@ -147,5 +193,5 @@ read_sstpc_password() {
     PASSWORD=""
     return 1
   fi
-  validate_sstpc_password "$PASSWORD"
+  validate_sstpc_password "$PASSWORD" "$has_gui_fixes"
 }

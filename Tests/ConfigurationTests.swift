@@ -12,8 +12,7 @@ struct ConfigurationTests {
             ("192.0.2.1", "1", "192.0.2.1", 1),
             ("vpn.example.com.", "00443", "vpn.example.com.", 443),
             ("vpn", "443", "vpn", 443),
-            ("vpn-01.example", String(repeating: "0", count: 100) + "443", "vpn-01.example", 443),
-            ("192.000.002.001", "443", "192.000.002.001", 443)
+            ("vpn-01.example", String(repeating: "0", count: 100) + "443", "vpn-01.example", 443)
         ]
         for (server, port, expectedHost, expectedPort) in accepted {
             let endpoint = try VPNEndpoint(server: server, port: port)
@@ -31,7 +30,7 @@ struct ConfigurationTests {
             ("-n", "443"), ("vpn-.example", "443"), ("vpn..example", "443"),
             ("vpn example", "443"), ("vpn|example", "443"), ("vpn\nexample", "443"),
             ("256.0.0.1", "443"), ("127.1", "443"), ("1234", "443"),
-            ("1.2.3.4.", "443"), ("0001.2.3.4", "443"),
+            ("1.2.3.4.", "443"), ("0001.2.3.4", "443"), ("192.000.002.001", "443"),
             (String(repeating: "x", count: 64) + ".example", "443"),
             (Array(repeating: String(repeating: "x", count: 63), count: 4).joined(separator: "."), "443"),
             ("\u{00A0}vpn.example", "443")
@@ -68,6 +67,43 @@ struct ConfigurationTests {
                 }
             }
         }
-        print("Swift configuration tests passed (endpoints, legacy profiles, password guards)")
+        for password in ["a\"b", "a\\b", "a\\\"b", String(repeating: "a", count: 255), String(repeating: "я", count: 127)] {
+            try VPNCredentials.validate(password: password, supportsGUIFixes: true)
+        }
+        for password in ["", "a\nb", "a\rb", "a\r\nb", "a\0b", String(repeating: "a", count: 256), String(repeating: "я", count: 128)] {
+            do {
+                try VPNCredentials.validate(password: password, supportsGUIFixes: true)
+                fatalError("Accepted unsupported patched-client password")
+            } catch is VPNCredentials.ValidationError { }
+        }
+
+        let preferred = SSTPClientDependency.preferredPaths[0]
+        let alternate = SSTPClientDependency.preferredPaths[1]
+        let stock = SSTPClientDependency.stockPaths[0]
+        let patchedVersion = "sstp-client 1.0.20 sstp-gui-fixes-1\n"
+        func select(_ versions: [String: String]) -> SSTPClientDependency? {
+            SSTPClientDependency.find(isExecutable: { versions[$0] != nil }, readVersion: { versions[$0]! })
+        }
+        precondition(select([:]) == nil)
+        let stockOnly = select([stock: "sstp-client 1.0.20"])
+        precondition(stockOnly?.path == stock && stockOnly?.supportsGUIFixes == false)
+        let patchedPreferred = select([preferred: patchedVersion, stock: "sstp-client 1.0.20"])
+        precondition(patchedPreferred?.path == preferred && patchedPreferred?.supportsGUIFixes == true)
+        precondition(select([preferred: "sstp-client 1.0.20", stock: "sstp-client 1.0.20"])?.path == stock)
+        precondition(select([preferred: "sstp-client 1.0.20", alternate: patchedVersion])?.path == alternate)
+        precondition(select([stock: patchedVersion])?.supportsGUIFixes == true)
+        for misleading in ["sstp-gui-fixes-10", "1.0.20-sstp-gui-fixes-1", "/tmp/sstp-gui-fixes-1", "sstp-gui-fixes-1.exe"] {
+            precondition(select([preferred: misleading]) == nil, "Accepted an inexact capability marker")
+        }
+        for patched in [false, true] {
+            try VPNCertificates.validateSelection(customPath: "/chosen/ca.pem", ignoreVerification: false, supportsGUIFixes: patched)
+            try VPNCertificates.validateSelection(customPath: "", ignoreVerification: true, supportsGUIFixes: patched)
+        }
+        try VPNCertificates.validateSelection(customPath: "", ignoreVerification: false, supportsGUIFixes: true)
+        do {
+            try VPNCertificates.validateSelection(customPath: "", ignoreVerification: false, supportsGUIFixes: false)
+            fatalError("Enabled automatic CA selection with stock client")
+        } catch is VPNCredentials.ValidationError { }
+        print("Swift configuration tests passed (endpoints, legacy profiles, stock/patched capabilities)")
     }
 }

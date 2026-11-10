@@ -47,7 +47,8 @@ struct VPNEndpoint: Equatable {
               }) else { throw ValidationError.invalidHost }
         if dnsName.utf8.allSatisfy({ (48...57).contains($0) || $0 == 46 }) {
             guard !host.hasSuffix("."), labels.count == 4, labels.allSatisfy({ label in
-                guard label.count <= 3, let octet = Int(label) else { return false }
+                guard label.count <= 3, (label.count == 1 || !label.hasPrefix("0")),
+                      let octet = Int(label) else { return false }
                 return (0...255).contains(octet)
             }) else { throw ValidationError.invalidHost }
         }
@@ -75,17 +76,54 @@ enum VPNCredentials {
         let errorDescription: String?
     }
 
-    static func validate(password: String) throws {
+    static func validate(password: String, supportsGUIFixes: Bool = false) throws {
         guard !password.isEmpty else {
             throw ValidationError(errorDescription: "Password is required")
         }
-        // sstpc writes --password into pppd's options without quoting these
-        // characters. Pre-escaping would also change the MPPE key input.
-        guard !password.unicodeScalars.contains(where: { [0, 10, 13, 34, 92].contains($0.value) }) else {
-            throw ValidationError(errorDescription: "The current sstp-client password handoff does not safely support quotes, backslashes or line breaks. Connection was stopped before passing the password to sstpc.")
+        guard !password.unicodeScalars.contains(where: { [0, 10, 13].contains($0.value) }) else {
+            throw ValidationError(errorDescription: "Passwords cannot contain NUL characters or line breaks")
         }
-        guard password.utf8.count <= 242 else {
-            throw ValidationError(errorDescription: "The current sstp-client password handoff does not safely support passwords longer than 242 UTF-8 bytes. Connection was stopped before passing the password to sstpc.")
+        // Only the patched dependency escapes the pppd file while retaining the
+        // original password for MPPE. Never pre-escape the --password argument.
+        if !supportsGUIFixes && password.unicodeScalars.contains(where: { [34, 92].contains($0.value) }) {
+            throw ValidationError(errorDescription: "Upgrade the SSTP component in Setup to use passwords containing quotes or backslashes")
+        }
+        let limit = supportsGUIFixes ? 255 : 242
+        guard password.utf8.count <= limit else {
+            throw ValidationError(errorDescription: supportsGUIFixes
+                ? "Passwords must not exceed 255 UTF-8 bytes"
+                : "Upgrade the SSTP component in Setup to use passwords longer than 242 UTF-8 bytes (maximum 255)")
+        }
+    }
+}
+
+struct SSTPClientDependency {
+    static let capabilityMarker = "sstp-gui-fixes-1"
+    static let preferredPaths = ["/opt/homebrew/opt/sstp-client-gui/sbin/sstpc", "/usr/local/opt/sstp-client-gui/sbin/sstpc"]
+    static let stockPaths = ["/opt/homebrew/sbin/sstpc", "/usr/local/sbin/sstpc"]
+
+    let path: String
+    let version: String
+
+    var supportsGUIFixes: Bool {
+        // Require a complete marker token, so fixes-10 or a filename cannot
+        // accidentally advertise fixes-1 compatibility.
+        version.split(whereSeparator: { $0.isWhitespace }).contains(Substring(Self.capabilityMarker))
+    }
+
+    static func find(isExecutable: (String) -> Bool, readVersion: (String) -> String) -> SSTPClientDependency? {
+        for path in preferredPaths + stockPaths where isExecutable(path) {
+            let dependency = SSTPClientDependency(path: path, version: readVersion(path))
+            if stockPaths.contains(path) || dependency.supportsGUIFixes { return dependency }
+        }
+        return nil
+    }
+}
+
+enum VPNCertificates {
+    static func validateSelection(customPath: String, ignoreVerification: Bool, supportsGUIFixes: Bool) throws {
+        if !ignoreVerification && customPath.isEmpty && !supportsGUIFixes {
+            throw VPNCredentials.ValidationError(errorDescription: "Upgrade the SSTP component in Setup to use automatic certificate verification, or choose a CA certificate file")
         }
     }
 }

@@ -59,6 +59,7 @@ final class VPNModel: ObservableObject {
 
     @Published var brewOK = false
     @Published var sstpOK = false
+    @Published var sstpHasGUIFixes = false
     @Published var pppdOK = false
     @Published var optionsOK = false
     @Published var brewText = ""
@@ -179,21 +180,29 @@ final class VPNModel: ObservableObject {
         ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
-    private func sstpcPath() -> String? {
-        ["/opt/homebrew/sbin/sstpc", "/usr/local/sbin/sstpc"].first { FileManager.default.isExecutableFile(atPath: $0) }
+    private func sstpcDependency() -> SSTPClientDependency? {
+        SSTPClientDependency.find(
+            isExecutable: { FileManager.default.isExecutableFile(atPath: $0) },
+            readVersion: { self.run($0, ["--version"]).trimmingCharacters(in: .whitespacesAndNewlines) }
+        )
     }
+
+    private func sstpcPath() -> String? { sstpcDependency()?.path }
 
     func checkComponents() {
         DispatchQueue.global(qos: .utility).async {
             let brew = self.brewPath()
-            let sstp = self.sstpcPath()
+            let sstp = self.sstpcDependency()
             let brewText = brew.map { self.run($0, ["--version"]).components(separatedBy: "\n").first ?? "OK" } ?? "Not installed"
-            let sstpText = sstp.map { self.run($0, ["--version"]).trimmingCharacters(in: .whitespacesAndNewlines) } ?? "Not installed"
+            let sstpText = sstp.map {
+                $0.version + ($0.supportsGUIFixes ? "" : " — upgrade for special-character passwords and automatic certificate verification")
+            } ?? "Not installed"
             let pppdOK = FileManager.default.isExecutableFile(atPath: "/usr/sbin/pppd")
             let optionsOK = FileManager.default.fileExists(atPath: "/etc/ppp/options")
             DispatchQueue.main.async {
                 self.brewOK = brew != nil
                 self.sstpOK = sstp != nil
+                self.sstpHasGUIFixes = sstp?.supportsGUIFixes ?? false
                 self.pppdOK = pppdOK
                 self.optionsOK = optionsOK
                 self.brewText = brewText
@@ -336,19 +345,26 @@ final class VPNModel: ObservableObject {
         try VPNEndpoint(server: server, port: port)
     }
 
+    func useSystemCertificate() {
+        certificatePath = ""
+        savePreferences()
+    }
+
     func connect() {
         guard ready else { status = .error; message = "Install required components first"; return }
         guard !server.isEmpty, !username.isEmpty, !password.isEmpty else { status = .error; message = "Server, username and password are required"; return }
         guard let controller = controllerPath else { status = .error; message = "vpnctl.sh is missing from the app bundle"; return }
-        if !ignoreCertificate && certificatePath.isEmpty {
+        guard let dependency = sstpcDependency() else {
             status = .error
-            message = "Choose a CA certificate file before connecting"
+            message = "Install the SSTP component in Setup"
             return
         }
+        sstpHasGUIFixes = dependency.supportsGUIFixes
         let endpoint: VPNEndpoint
         do {
             endpoint = try self.endpoint()
-            try VPNCredentials.validate(password: password)
+            try VPNCredentials.validate(password: password, supportsGUIFixes: dependency.supportsGUIFixes)
+            try VPNCertificates.validateSelection(customPath: certificatePath, ignoreVerification: ignoreCertificate, supportsGUIFixes: dependency.supportsGUIFixes)
         } catch {
             status = .error
             message = error.localizedDescription
@@ -746,12 +762,15 @@ struct ContentView: View {
                                 Toggle("Ignore certificate verification (--cert-warn)", isOn: $vpn.ignoreCertificate)
                                 if !vpn.ignoreCertificate {
                                     HStack {
-                                        Text(vpn.certificatePath.isEmpty ? "No CA certificate selected" : vpn.certificatePath)
+                                        Text(vpn.certificatePath.isEmpty ? (vpn.sstpHasGUIFixes ? "System CA bundle (/etc/ssl/cert.pem)" : "No CA certificate selected — upgrade SSTP in Setup to use system CA") : vpn.certificatePath)
                                             .font(.caption)
                                             .foregroundColor(.secondary)
                                             .lineLimit(1)
                                             .truncationMode(.middle)
                                         Spacer()
+                                        if vpn.sstpHasGUIFixes && !vpn.certificatePath.isEmpty {
+                                            Button("Use system CA") { vpn.useSystemCertificate() }
+                                        }
                                         Button("Choose certificate") { vpn.chooseCertificate() }
                                     }
                                 }
@@ -836,8 +855,8 @@ struct ContentView: View {
                             }
                             .controlSize(.large)
 
-                            if !vpn.ready {
-                                Button("Install components") { vpn.installComponents() }
+                            if !vpn.ready || !vpn.sstpHasGUIFixes {
+                                Button(vpn.ready ? "Upgrade SSTP component" : "Install components") { vpn.installComponents() }
                                     .buttonStyle(.borderedProminent)
                                     .controlSize(.large)
                             }

@@ -1,0 +1,307 @@
+class SstpClientGui < Formula
+  desc "SSTP client with credential and TLS verification fixes for SSTP Client GUI"
+  homepage "https://github.com/tolabzik/sstp_client_gui_mac_os"
+  url "https://gitlab.com/sstp-project/sstp-client/-/releases/1.0.20/downloads/dist-gzip/sstp-client-1.0.20.tar.gz"
+  sha256 "6c84b6cdcc21ebea6daeb8c5356dcdfd8681f4981a734f8485ed0b31fc30aadd"
+  license "GPL-2.0-or-later"
+  revision 1
+
+  keg_only "installed alongside stock sstp-client for SSTP Client GUI"
+
+  depends_on "pkgconf" => :build
+  depends_on "libevent"
+  depends_on "openssl@3"
+
+  # Kept identical to Patches/sstp-client-1.0.20-gui.patch by regression tests.
+  patch :DATA
+
+  def install
+    system "./configure", "--disable-silent-rules",
+                          "--disable-ppp-plugin",
+                          "--with-openssl=#{Formula["openssl@3"].opt_prefix}",
+                          "--with-runtime-dir=#{var}/run/sstpc",
+                          *std_configure_args
+    system "make", "install"
+    (var/"run/sstpc").mkpath
+  end
+
+  test do
+    assert_match "sstp-gui-fixes-1", shell_output("#{sbin}/sstpc --version")
+  end
+end
+
+__END__
+--- a/src/sstp-client.c
++++ b/src/sstp-client.c
+@@ -224,7 +224,7 @@
+     vopts = SSTP_VERIFY_NAME;
+     if (opts->ca_cert || opts->ca_path)
+     {
+-        vopts = SSTP_VERIFY_CERT;
++        vopts |= SSTP_VERIFY_CERT;
+     }
+ 
+     /* Verify the server certificate */
+--- a/src/sstp-option.c
++++ b/src/sstp-option.c
+@@ -111,7 +111,7 @@
+  */
+ static void sstp_print_version(const char *prog)
+ {
+-    printf("%s version %s\n", PACKAGE_NAME, PACKAGE_VERSION);
++    printf("%s version %s sstp-gui-fixes-1\n", PACKAGE_NAME, PACKAGE_VERSION);
+     exit(0);
+ }
+ 
+--- a/src/sstp-pppd.c
++++ b/src/sstp-pppd.c
+@@ -11,6 +11,7 @@
+ #include <config.h>
+ #include <errno.h>
+ #include <stdlib.h>
++#include <stdint.h>
+ #include <string.h>
+ #include <unistd.h>
+ #include <paths.h>
+@@ -500,6 +501,58 @@
+ }
+ 
+ 
++
++/* Quote only the pppd representation. opts->password must remain unchanged
++ * because the original secret is also used to derive the SSTP MPPE keys. */
++static int sstp_pppd_write_password(int fd, const char *password)
++{
++    static const char prefix[] = "password \"";
++    size_t length = strlen(password);
++    size_t used = sizeof(prefix) - 1;
++    size_t offset = 0;
++    char *buffer;
++
++    if (length > (SIZE_MAX - sizeof(prefix) - 2) / 2)
++    {
++        errno = EOVERFLOW;
++        return -1;
++    }
++    buffer = malloc(sizeof(prefix) + length * 2 + 2);
++    if (!buffer)
++        return -1;
++    memcpy(buffer, prefix, used);
++    for (size_t index = 0; index < length; index++)
++    {
++        unsigned char byte = (unsigned char) password[index];
++        if (byte == '\\' || byte == '"')
++            buffer[used++] = '\\';
++        if (byte == '\r' || byte == '\n')
++        {
++            buffer[used++] = '\\';
++            byte = byte == '\r' ? 'r' : 'n';
++        }
++        buffer[used++] = byte;
++    }
++    buffer[used++] = '"';
++    buffer[used++] = '\n';
++    while (offset < used)
++    {
++        ssize_t written = write(fd, buffer + offset, used - offset);
++        if (written < 0 && errno == EINTR)
++            continue;
++        if (written <= 0)
++        {
++            int saved_errno = written < 0 ? errno : EIO;
++            free(buffer);
++            errno = saved_errno;
++            return -1;
++        }
++        offset += (size_t) written;
++    }
++    free(buffer);
++    return 0;
++}
++
+ status_t sstp_pppd_start(sstp_pppd_st *ctx, sstp_option_st *opts,
+         const char *sockname)
+ {
+@@ -540,7 +593,6 @@
+         if (opts->password)
+         {
+             int fd = 0;
+-            char buff[255];
+             /* 077, all new files created will only be read-/write- able by current user */
+             mode_t mode = umask(S_IRWXG | S_IRWXO);
+ 
+@@ -548,25 +600,27 @@
+ 
+             /* Create a file to keep the options */
+             fd = mkstemp(ctx->tmpfile);
+-            if (fd <= 0)
++            umask(mode);
++            if (fd < 0)
+             {
+                 log_err("Could not create pppd script");
+                 goto done;
+             }
+ 
+-            /* Restore the umask */
+-            umask(mode);
+-
+-            /* Dump password to temporary file */
+-            j = snprintf(buff, sizeof(buff), "password \"%s\"\n", opts->password);
+-            if (write(fd, buff, j) != j)
++            if (sstp_pppd_write_password(fd, opts->password) < 0)
+             {
+-                log_warn("Could not write password to file");
++                log_err("Could not write password to file");
++                close(fd);
++                unlink(ctx->tmpfile);
++                goto done;
+             }
+-
+-            /* Close file, and enable check for auth */
++            if (close(fd) < 0)
++            {
++                log_err("Could not close password file");
++                unlink(ctx->tmpfile);
++                goto done;
++            }
+             ctx->auth_check = 1;
+-            close(fd);
+ 
+             /* Append the file argument to pppd */
+             args[i++] = "file";
+--- a/src/sstp-stream.c
++++ b/src/sstp-stream.c
+@@ -18,6 +18,7 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include <openssl/ssl.h>
++#include <openssl/x509v3.h>
+ 
+ #include "sstp-private.h"
+ 
+@@ -343,59 +344,62 @@
+ }
+ 
+ 
++/* Match the identity on the certificate from this exact TLS connection.
++ * OpenSSL checks subjectAltName (including IP SANs), falling back to CN only
++ * for DNS certificates without a DNS SAN. Partial-label wildcards are refused. */
++static int sstp_certificate_matches_host(X509 *certificate, const char *host)
++{
++    unsigned char address[sizeof(struct in6_addr)];
++    if (inet_pton(AF_INET, host, address) == 1 ||
++        inet_pton(AF_INET6, host, address) == 1)
++        return X509_check_ip_asc(certificate, host, 0) == 1;
++    return X509_check_host(certificate, host, 0,
++            X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS, NULL) == 1;
++}
++
+ status_t sstp_verify_cert(sstp_stream_st *ctx, const char *host, int opts)
+ {
+     status_t status = SSTP_FAIL;
+-    X509_NAME *name = NULL;
+     X509 *peer = NULL;
+-    char result[256];
+-    
+-    /* Get the peer certificate */
++    sstp_url_st *identity = NULL;
++
+     peer = SSL_get_peer_certificate(ctx->ssl);
+     if (!peer)
+     {
+         log_err("Could not get peer certificate");
+         goto done;
+     }
+-
+-    /* Verify the certificate chain */
+     if (SSTP_VERIFY_CERT & opts)
+     {
+-        int ret = SSL_get_verify_result(ctx->ssl);
+-        if (X509_V_OK != ret)
+-        { 
+-            log_info("SSL certificate verification failed: %s (%d)", 
+-                    X509_verify_cert_error_string(ret), ret);
++        long result = SSL_get_verify_result(ctx->ssl);
++        if (X509_V_OK != result)
++        {
++            log_info("SSL certificate verification failed: %s (%ld)",
++                    X509_verify_cert_error_string(result), result);
+             goto done;
+         }
+     }
+-
+-    /* Verify the name of the server */
+     if (SSTP_VERIFY_NAME & opts)
+     {
+-        /* Extract the subject name field */
+-        name = X509_get_subject_name(peer);
+-        if (!name)
++        /* The positional server can include :port; it is not a DNS name. */
++        if (!host || sstp_url_parse(&identity, host) != SSTP_OKAY)
+         {
+-            log_err("Could not get subject name");
++            log_err("Could not parse certificate hostname");
+             goto done;
+         }
+-
+-        /* Get the common name of the certificate */
+-        X509_NAME_get_text_by_NID(name, NID_commonName, 
+-                result, sizeof(result));
+-        if (strcasecmp(host, result))
++        size_t length = strlen(identity->host);
++        if (length > 0 && identity->host[length - 1] == '.')
++            identity->host[length - 1] = '\0';
++        if (!identity->host[0] || !sstp_certificate_matches_host(peer, identity->host))
+         {
+-            log_info("The certificate did not match the host: %s", host);
++            log_info("The certificate did not match the requested host");
+             goto done;
+         }
+     }
+-
+-    /* Success */
+     status = SSTP_OKAY;
+-
+ done:
+-
++    sstp_url_free(identity);
++    X509_free(peer);
+     return status;
+ }
+ 
+@@ -678,6 +682,26 @@
+ /**
+  * Configure the SSL object, setup socket and enable TLS SNI extenion if specified
+  */
++static int sstp_stream_set_server_name(SSL *ssl, const char *target)
++{
++    sstp_url_st *identity = NULL;
++    unsigned char address[sizeof(struct in6_addr)];
++    int result = 0;
++    if (!target || sstp_url_parse(&identity, target) != SSTP_OKAY)
++        return 0;
++    size_t length = strlen(identity->host);
++    if (length > 0 && identity->host[length - 1] == '.')
++        identity->host[length - 1] = '\0';
++    /* RFC 6066: the SNI HostName contains a DNS name, not an IP or port. */
++    if (inet_pton(AF_INET, identity->host, address) == 1 ||
++        inet_pton(AF_INET6, identity->host, address) == 1)
++        result = 1;
++    else if (identity->host[0])
++        result = SSL_set_tlsext_host_name(ssl, identity->host) == 1;
++    sstp_url_free(identity);
++    return result;
++}
++
+ static status_t sstp_stream_setup(sstp_stream_st *stream)
+ {
+     sstp_option_st *opts = stream->opts;
+@@ -699,7 +723,7 @@
+     
+     /* Set the SNI field within the TLS extensions */
+     if (opts->enable & SSTP_OPT_TLSEXT &&
+-        !SSL_set_tlsext_host_name(stream->ssl, opts->host ?: opts->server)) 
++        !sstp_stream_set_server_name(stream->ssl, opts->host ?: opts->server)) 
+     {
+         log_err("Unable to set TLS hostname extension");
+         goto done;
