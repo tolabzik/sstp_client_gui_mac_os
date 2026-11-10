@@ -480,21 +480,82 @@ final class QuickHealthModel: ObservableObject {
     @Published var running = false
     @Published var headline = "Not checked"
 
-    private func run(_ executable: String, _ args: [String]) -> (String, Int32) {
+    private func run(_ executable: String, _ args: [String], timeout: TimeInterval = 8) -> (String, Int32) {
         let process = Process()
         let pipe = Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = args
         process.standardOutput = pipe
         process.standardError = pipe
+        let reader = pipe.fileHandleForReading
+        defer {
+            try? reader.close()
+            try? pipe.fileHandleForWriting.close()
+        }
+        let descriptor = reader.fileDescriptor
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0 else {
+            return ("Could not read health check output", -1)
+        }
         do {
             try process.run()
-            process.waitUntilExit()
-            let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            return (output, process.terminationStatus)
         } catch {
             return (error.localizedDescription, -1)
         }
+        try? pipe.fileHandleForWriting.close()
+
+        let deadline = ProcessInfo.processInfo.systemUptime + max(0, timeout)
+        var terminateDeadline: TimeInterval?
+        var killDeadline: TimeInterval?
+        var drainDeadline: TimeInterval?
+        var output = Data()
+        var buffer = [UInt8](repeating: 0, count: 8192)
+        let outputLimit = 1_048_576
+
+        while true {
+            var drained = false
+            // Drain while the child runs. Bound each batch so a noisy child
+            // cannot postpone the deadline indefinitely.
+            for _ in 0..<16 {
+                let count = read(descriptor, &buffer, buffer.count)
+                if count > 0 {
+                    let retained = min(count, outputLimit - output.count)
+                    output.append(contentsOf: buffer.prefix(retained))
+                } else if count < 0 && errno == EINTR {
+                    continue
+                } else {
+                    drained = true
+                    break
+                }
+            }
+
+            let now = ProcessInfo.processInfo.systemUptime
+            if !process.isRunning {
+                // A descendant may retain or keep writing to the pipe. Read
+                // buffered output without waiting for that descendant's EOF.
+                if drained { break }
+                if drainDeadline == nil { drainDeadline = now + 0.1 }
+                if now >= drainDeadline! { break }
+            } else if let killedBy = killDeadline {
+                if now >= killedBy { break }
+            } else if let terminatedBy = terminateDeadline {
+                if now >= terminatedBy {
+                    kill(process.processIdentifier, SIGKILL)
+                    killDeadline = now + 0.5
+                }
+            } else if now >= deadline {
+                process.terminate()
+                terminateDeadline = now + 0.5
+            }
+
+            if drained { Thread.sleep(forTimeInterval: 0.01) }
+        }
+
+        let text = String(decoding: output, as: UTF8.self)
+        if terminateDeadline != nil {
+            return (text + "\nHealth check timed out\n", 124)
+        }
+        return (text, process.terminationStatus)
     }
 
     func refresh(vpn: VPNModel) {

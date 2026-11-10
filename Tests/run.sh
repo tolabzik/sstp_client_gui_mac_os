@@ -11,6 +11,8 @@ done
 
 /bin/bash "$ROOT/Tests/backend_config_test.sh"
 /bin/bash "$ROOT/Tests/setup_test.sh"
+/bin/bash "$ROOT/Tests/dns_cleanup_test.sh"
+/bin/bash "$ROOT/Tests/health_process_test.sh"
 xcrun swiftc -parse-as-library -module-cache-path "$WORK/module-cache" \
   "$ROOT/Sources/VPNConfiguration.swift" "$ROOT/Tests/ConfigurationTests.swift" \
   -o "$WORK/configuration-tests"

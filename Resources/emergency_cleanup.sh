@@ -4,6 +4,8 @@ umask 077
 
 SERVER="${1:-}"
 LOG="/tmp/sstp-gui-purge.log"
+SERVICEFILE="/tmp/sstp-gui-service.id"
+DNS_HELPERS="$(cd "$(dirname "$0")" && pwd)/vpnctl_dns.sh"
 
 if [ "$(/usr/bin/id -u)" -ne 0 ]; then
   echo "Run as root: sudo bash $0 [vpn-server]" >&2
@@ -113,6 +115,13 @@ done
 
 echo
 echo "--- Refreshing DNS resolver cache ---"
+DNS_CLEANUP_OK=1
+if [ -f "$DNS_HELPERS" ]; then
+  . "$DNS_HELPERS"
+  cleanup_owned_service || DNS_CLEANUP_OK=0
+elif [ -e "$SERVICEFILE" ] || [ -L "$SERVICEFILE" ]; then
+  DNS_CLEANUP_OK=0
+fi
 /usr/bin/dscacheutil -flushcache >/dev/null 2>&1 || true
 /usr/bin/killall -HUP mDNSResponder >/dev/null 2>&1 || true
 sleep 1
@@ -140,6 +149,12 @@ printf '%s\n' "${PPP_DNS:-NONE}"
 if [ -n "$LEFT_HELPERS" ]; then
   echo
   echo "ERROR: SSTP helper processes are still alive"
+  exit 2
+fi
+
+if [ "$DNS_CLEANUP_OK" != 1 ]; then
+  echo
+  echo "ERROR: Owned PPP DNS cleanup is incomplete; the ownership record was retained"
   exit 2
 fi
 

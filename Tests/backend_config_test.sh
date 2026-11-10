@@ -146,6 +146,7 @@ fi
 # operation after validation is replaced with a fail-fast boundary: even if a
 # validation regresses, this harness cannot reach route/process cleanup.
 cp "$ROOT/Resources/vpnctl_config.sh" "$WORK/vpnctl_config.sh"
+cp "$ROOT/Resources/vpnctl_dns.sh" "$WORK/vpnctl_dns.sh"
 awk '
   /^case "\$ACTION" in$/ {
     print "RESULT=\"$TEST_WORK/result\""

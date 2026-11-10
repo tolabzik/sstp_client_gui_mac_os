@@ -20,6 +20,7 @@ WATCHDOG_LOG="/tmp/sstp-gui-watchdog.log"
 STOPFILE="/tmp/sstp-gui.stop"
 HELPER_PIDFILE="/tmp/sstp-gui-helper.pids"
 HELPER_FILELIST="/tmp/sstp-gui-helper.files"
+SERVICEFILE="/tmp/sstp-gui-service.id"
 
 SSTPC=""
 SSTPC_HAS_GUI_FIXES=0
@@ -41,6 +42,11 @@ if [ ! -f "$CONFIG_HELPERS" ]; then
   reject_connect "vpnctl_config.sh is missing from the app bundle"
 fi
 . "$CONFIG_HELPERS"
+DNS_HELPERS="$(cd "$(dirname "$0")" && pwd)/vpnctl_dns.sh"
+if [ ! -f "$DNS_HELPERS" ]; then
+  reject_connect "vpnctl_dns.sh is missing from the app bundle"
+fi
+. "$DNS_HELPERS"
 if [ "$ACTION" = connect ]; then
   select_sstpc || true
 fi
@@ -135,30 +141,54 @@ EOF_FILES
 
 kill_pid_gracefully() {
   TARGET_PID="$1"
+  WAIT_STEPS="${2:-10}"
   [ -n "$TARGET_PID" ] || return 0
   kill -0 "$TARGET_PID" >/dev/null 2>&1 || return 0
   kill -TERM "$TARGET_PID" >/dev/null 2>&1 || true
   I=0
-  while [ "$I" -lt 10 ] && kill -0 "$TARGET_PID" >/dev/null 2>&1; do
+  while [ "$I" -lt "$WAIT_STEPS" ] && kill -0 "$TARGET_PID" >/dev/null 2>&1; do
     sleep 0.2
     I=$((I + 1))
   done
   if kill -0 "$TARGET_PID" >/dev/null 2>&1; then
     kill -KILL "$TARGET_PID" >/dev/null 2>&1 || true
+    I=0
+    while [ "$I" -lt 10 ] && kill -0 "$TARGET_PID" >/dev/null 2>&1; do
+      sleep 0.2
+      I=$((I + 1))
+    done
   fi
+  ! kill -0 "$TARGET_PID" >/dev/null 2>&1
 }
 
 kill_owned_helpers() {
-  [ -f "$HELPER_PIDFILE" ] || return 0
-  while IFS= read -r HPID; do
-    case "$HPID" in
-      ''|*[!0-9]*) continue ;;
-    esac
-    CMD="$(/bin/ps -p "$HPID" -o command= 2>/dev/null || true)"
-    if printf '%s' "$CMD" | /usr/bin/grep -Eq '/tmp/+sstp-pppd\.'; then
-      kill_pid_gracefully "$HPID"
-    fi
-  done < "$HELPER_PIDFILE"
+  local owned_id
+  if [ -f "$HELPER_PIDFILE" ]; then
+    while IFS= read -r HPID; do
+      case "$HPID" in
+        ''|*[!0-9]*) continue ;;
+      esac
+      CMD="$(/bin/ps -p "$HPID" -o command= 2>/dev/null || true)"
+      if printf '%s' "$CMD" | /usr/bin/grep -Eq '/tmp/+sstp-pppd\.'; then
+        # Let pppd complete LCP termination and unpublish DNS before escalation.
+        kill_pid_gracefully "$HPID" 50
+      fi
+    done < "$HELPER_PIDFILE"
+  fi
+  # Also find the explicitly named session if pppd daemonized between PID
+  # snapshots or a previous failed cleanup retained only its service record.
+  if service_file_is_owned; then
+    owned_id="$(cat "$SERVICEFILE" 2>/dev/null)"
+    valid_sstp_service_id "$owned_id" || return 0
+    for HPID in $(service_pppd_pids "$owned_id"); do
+      # sstpc also carries the forwarded serviceid arguments. Only pppd has
+      # the generated options-file argument; keep its transport until later.
+      CMD="$(/bin/ps -p "$HPID" -o command= 2>/dev/null || true)"
+      if printf '%s' "$CMD" | /usr/bin/grep -Eq '/tmp/+sstp-pppd\.'; then
+        kill_pid_gracefully "$HPID" 50
+      fi
+    done
+  fi
 }
 
 cleanup_tracked_temp_files() {
@@ -246,17 +276,23 @@ delete_owned_routes() {
 cleanup_all() {
   stop_watchdog
   delete_owned_routes
-  kill_owned_client
-  sleep 0.2
+  # Keep the SSTP transport available while pppd closes LCP gracefully.
   kill_owned_helpers
+  kill_owned_client
   cleanup_tracked_temp_files
+  if ! cleanup_owned_service; then
+    # Preserve PID/interface ownership for a later Repair attempt.
+    flush_dns_cache
+    return 1
+  fi
   /bin/rm -f "$PIDFILE" "$STATEFILE" "$HELPER_PIDFILE" "$HELPER_FILELIST"
   flush_dns_cache
+  return 0
 }
 
 fail() {
   MSG="$1"
-  cleanup_all
+  cleanup_all || true
   kill_orphan_sstp_helpers
   flush_dns_cache
   write_result "FAIL|$MSG"
@@ -307,6 +343,8 @@ watchdog_cleanup_after_crash() {
   cleanup_test_routes
   kill_owned_helpers
   cleanup_tracked_temp_files
+  DNS_CLEANUP_OK=1
+  cleanup_owned_service || DNS_CLEANUP_OK=0
   if [ -n "$STATE_SERVER" ] && [ -n "$STATE_GW" ] && [ -n "$STATE_PHY" ]; then
     CURRENT_GW="$(route_gateway "$STATE_SERVER")"
     CURRENT_IF="$(route_interface "$STATE_SERVER")"
@@ -314,10 +352,17 @@ watchdog_cleanup_after_crash() {
       /sbin/route -n delete -host "$STATE_SERVER" "$STATE_GW" >/dev/null 2>&1 || true
     fi
   fi
-  /bin/rm -f "$PIDFILE" "$STATEFILE" "$WATCHDOG_PIDFILE" "$HELPER_PIDFILE" "$HELPER_FILELIST"
+  /bin/rm -f "$WATCHDOG_PIDFILE"
+  if [ "$DNS_CLEANUP_OK" = 1 ]; then
+    /bin/rm -f "$PIDFILE" "$STATEFILE" "$HELPER_PIDFILE" "$HELPER_FILELIST"
+  fi
   kill_orphan_sstp_helpers
   flush_dns_cache
-  write_result "FAIL|VPN disconnected unexpectedly; SSTP/PPP helpers and routing were cleaned automatically"
+  if [ "$DNS_CLEANUP_OK" = 1 ]; then
+    write_result "FAIL|VPN disconnected unexpectedly; SSTP/PPP helpers, DNS and routing were cleaned automatically"
+  else
+    write_result "FAIL|VPN disconnected unexpectedly; PPP DNS cleanup is incomplete and ownership was retained for Repair"
+  fi
 }
 
 case "$ACTION" in
@@ -342,7 +387,10 @@ case "$ACTION" in
     ;;
 
   repair)
-    cleanup_all
+    if ! cleanup_all; then
+      write_result "FAIL|PPP DNS cleanup is incomplete; the session ownership record was retained for Repair"
+      exit 0
+    fi
     kill_orphan_sstp_helpers
     /bin/rm -f "$STOPFILE"
     flush_dns_cache
@@ -351,7 +399,10 @@ case "$ACTION" in
     ;;
 
   disconnect)
-    cleanup_all
+    if ! cleanup_all; then
+      write_result "FAIL|PPP DNS cleanup is incomplete; the session ownership record was retained for Repair"
+      exit 0
+    fi
     /bin/rm -f "$STOPFILE"
     write_result "OFF|Disconnected"
     exit 0
@@ -403,7 +454,7 @@ case "$ACTION" in
       SSTPC_ARGS+=(--cert-warn)
     fi
 
-    cleanup_all
+    cleanup_all || fail "Previous PPP DNS state could not be cleaned safely; run Repair before reconnecting"
     kill_orphan_sstp_helpers
     /bin/rm -f "$STOPFILE"
     sleep 0.5
@@ -437,9 +488,11 @@ case "$ACTION" in
     : > "$HELPER_FILELIST"
     chmod 0644 "$LOG" "$HELPER_PIDFILE" "$HELPER_FILELIST" 2>/dev/null || true
 
+    create_owned_service_id || fail "Could not reserve an owned PPP service ID; run Repair before reconnecting"
+
     "$SSTPC" "${SSTPC_ARGS[@]}" \
       --user "$USER_NAME" --password "$PASSWORD" "$SSTP_TARGET" \
-      usepeerdns require-mschap-v2 noauth >"$LOG" 2>&1 </dev/null &
+      usepeerdns require-mschap-v2 noauth serviceid "$SERVICE_ID" >"$LOG" 2>&1 </dev/null &
 
     SSTP_PID=$!
     unset PASSWORD
