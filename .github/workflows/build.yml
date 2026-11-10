@@ -18,6 +18,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Test connection configuration
+        run: bash Tests/run.sh
+
       - name: Build Universal app
         run: |
           chmod +x build.sh

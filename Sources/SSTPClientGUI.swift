@@ -47,6 +47,7 @@ enum VPNStatus: Equatable {
 
 final class VPNModel: ObservableObject {
     @Published var server = ""
+    @Published var port = "443"
     @Published var username = ""
     @Published var password = ""
     @Published var ignoreCertificate = false
@@ -120,6 +121,7 @@ final class VPNModel: ObservableObject {
     private func loadPreferences() {
         let d = UserDefaults.standard
         server = d.string(forKey: "server") ?? ""
+        port = d.string(forKey: "port") ?? "443"
         username = d.string(forKey: "username") ?? ""
         ignoreCertificate = d.object(forKey: "ignoreCertificate") as? Bool ?? false
         certificatePath = d.string(forKey: "certificatePath") ?? ""
@@ -131,6 +133,7 @@ final class VPNModel: ObservableObject {
     private func savePreferences() {
         let d = UserDefaults.standard
         d.set(server, forKey: "server")
+        d.set(port, forKey: "port")
         d.set(username, forKey: "username")
         d.set(ignoreCertificate, forKey: "ignoreCertificate")
         d.set(certificatePath, forKey: "certificatePath")
@@ -329,11 +332,30 @@ final class VPNModel: ObservableObject {
         } catch { return nil }
     }
 
+    func endpoint() throws -> VPNEndpoint {
+        try VPNEndpoint(server: server, port: port)
+    }
+
     func connect() {
         guard ready else { status = .error; message = "Install required components first"; return }
         guard !server.isEmpty, !username.isEmpty, !password.isEmpty else { status = .error; message = "Server, username and password are required"; return }
         guard let controller = controllerPath else { status = .error; message = "vpnctl.sh is missing from the app bundle"; return }
-        if !ignoreCertificate && certificatePath.isEmpty { status = .error; message = "Choose a CA/server certificate or enable certificate ignore mode"; return }
+        if !ignoreCertificate && certificatePath.isEmpty {
+            status = .error
+            message = "Choose a CA certificate file before connecting"
+            return
+        }
+        let endpoint: VPNEndpoint
+        do {
+            endpoint = try self.endpoint()
+            try VPNCredentials.validate(password: password)
+        } catch {
+            status = .error
+            message = error.localizedDescription
+            return
+        }
+        server = endpoint.host
+        port = String(endpoint.port)
         guard let secret = writeSecret() else { status = .error; message = "Could not prepare password handoff"; return }
 
         savePreferences()
@@ -341,7 +363,7 @@ final class VPNModel: ObservableObject {
         try? FileManager.default.removeItem(atPath: resultFile)
 
         let certMode = ignoreCertificate ? "ignore" : "verify"
-        let command = "/bin/bash \(shellQuote(controller)) connect \(shellQuote(server)) \(shellQuote(username)) \(shellQuote(secret)) \(shellQuote(certMode)) \(shellQuote(certificatePath)) \(fullTunnel ? "1" : "0")"
+        let command = "/bin/bash \(shellQuote(controller)) connect \(shellQuote(endpoint.host)) \(shellQuote(username)) \(shellQuote(secret)) \(shellQuote(certMode)) \(shellQuote(certificatePath)) \(fullTunnel ? "1" : "0") \(endpoint.port)"
         status = .connecting
         message = fullTunnel ? "Connecting; Full Tunnel will be enabled only after the PPP connectivity test" : "Connecting SSTP"
 
@@ -415,8 +437,14 @@ final class VPNModel: ObservableObject {
     }
 
     func useVPNServerAsDiagnosticTarget() {
-        diagnosticTarget = server
-        savePreferences()
+        do {
+            let endpoint = try self.endpoint()
+            diagnosticTarget = endpoint.host
+            diagnosticPort = String(endpoint.port)
+            savePreferences()
+        } catch {
+            diagnostics = error.localizedDescription
+        }
     }
 
     func runDiagnostics() {
@@ -424,11 +452,14 @@ final class VPNModel: ObservableObject {
         diagnostics = "Running extended diagnostics…"
         savePreferences()
 
-        let serverCopy = server.trimmingCharacters(in: .whitespacesAndNewlines)
+        let serverIsSet = !server.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let serverEndpoint = Result { try endpoint() }
+        let serverCopy = try? serverEndpoint.get()
         let requestedTarget = diagnosticTarget.trimmingCharacters(in: .whitespacesAndNewlines)
-        let targetCopy = requestedTarget.isEmpty ? serverCopy : requestedTarget
+        let targetCopy = requestedTarget.isEmpty ? (serverCopy?.host ?? "") : requestedTarget
         let parsedPort = Int(diagnosticPort.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 443
-        let portCopy = (1...65535).contains(parsedPort) ? parsedPort : 443
+        let targetPort = (1...65535).contains(parsedPort) ? parsedPort : 443
+        let portCopy = requestedTarget.isEmpty ? (serverCopy?.port ?? targetPort) : targetPort
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
 
@@ -463,7 +494,7 @@ final class VPNModel: ObservableObject {
             section("VPN PROCESS"); out += self.runShell("if [ -f /tmp/sstp-gui.pid ]; then PID=$(cat /tmp/sstp-gui.pid); ps -p \"$PID\" -o pid,ppid,user,etime,comm; else echo NONE; fi")
             section("WATCHDOG"); out += self.runShell("if [ -f /tmp/sstp-gui-watchdog.pid ]; then echo PID=$(cat /tmp/sstp-gui-watchdog.pid); ps -p $(cat /tmp/sstp-gui-watchdog.pid) -o pid,ppid,user,etime,comm 2>/dev/null || true; else echo NONE; fi; tail -n 30 /tmp/sstp-gui-watchdog.log 2>/dev/null || true")
             section("PPP INTERFACES"); out += self.runShell("/sbin/ifconfig | grep -A 12 '^ppp' || true")
-            section("SSTP HELPER PROCESSES"); out += self.runShell("pgrep -lf 'sstpc|sstp-pppd' || echo NONE")
+            section("SSTP HELPER PROCESSES"); out += self.runShell("PIDS=$(pgrep -f 'sstpc|sstp-pppd' | paste -sd, -); if [ -n \"$PIDS\" ]; then ps -p \"$PIDS\" -o pid,ppid,comm; else echo NONE; fi")
             section("VPN CONFLICT CHECK")
             out += self.runShell("echo 'PPP:'; /sbin/ifconfig -l | tr ' ' '\\n' | grep '^ppp[0-9]' || true; echo 'Split-default routes:'; /usr/sbin/netstat -rn -f inet | awk '$1==\"0/1\" || $1==\"0.0.0.0/1\" || $1==\"128.0/1\" || $1==\"128.0.0.0/1\" {print}'; echo 'Default path:'; /sbin/route -n get 1.1.1.1 2>&1 | grep -E 'gateway:|interface:'")
             section("INTERNET ROUTE 1.1.1.1"); appendCommand("/sbin/route", ["-n", "get", "1.1.1.1"])
@@ -471,12 +502,14 @@ final class VPNModel: ObservableObject {
             section("INTERNET TCP 1.1.1.1:443"); appendCommand("/usr/bin/nc", ["-vz", "-G", "5", "1.1.1.1", "443"])
             section("INTERNET TRACEROUTE 1.1.1.1"); appendTrace("1.1.1.1")
 
-            if !serverCopy.isEmpty {
-                section("VPN SERVER DNS"); appendHostResolution(serverCopy)
-                section("VPN SERVER ROUTE"); appendCommand("/sbin/route", ["-n", "get", serverCopy])
-                section("VPN SERVER ICMP"); appendCommand("/sbin/ping", ["-c", "4", serverCopy])
-                section("VPN SERVER TCP 443"); appendCommand("/usr/bin/nc", ["-vz", "-G", "5", serverCopy, "443"])
-                section("VPN SERVER TRACEROUTE"); appendTrace(serverCopy)
+            if let endpoint = serverCopy {
+                section("VPN SERVER DNS"); appendHostResolution(endpoint.host)
+                section("VPN SERVER ROUTE"); appendCommand("/sbin/route", ["-n", "get", endpoint.host])
+                section("VPN SERVER ICMP"); appendCommand("/sbin/ping", ["-c", "4", endpoint.host])
+                section("VPN SERVER TCP \(endpoint.port)"); appendCommand("/usr/bin/nc", ["-vz", "-G", "5", endpoint.host, String(endpoint.port)])
+                section("VPN SERVER TRACEROUTE"); appendTrace(endpoint.host)
+            } else if serverIsSet, case .failure(let error) = serverEndpoint {
+                section("VPN SERVER CONFIGURATION"); out += error.localizedDescription + "\n"
             }
 
             if !targetCopy.isEmpty {
@@ -688,7 +721,12 @@ struct ContentView: View {
                                 HStack {
                                     Text("Server").frame(width: 86, alignment: .trailing).foregroundColor(.secondary)
                                     TextField("vpn.example.com", text: $vpn.server)
+                                    Text("Port").foregroundColor(.secondary)
+                                    TextField("443", text: $vpn.port).frame(width: 70)
                                 }
+                                Text("A port in Server (host:port) overrides the Port field. IPv4 and DNS names are supported.")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
                                 HStack {
                                     Text("Login").frame(width: 86, alignment: .trailing).foregroundColor(.secondary)
                                     TextField("DOMAIN\\user", text: $vpn.username)
@@ -708,7 +746,7 @@ struct ContentView: View {
                                 Toggle("Ignore certificate verification (--cert-warn)", isOn: $vpn.ignoreCertificate)
                                 if !vpn.ignoreCertificate {
                                     HStack {
-                                        Text(vpn.certificatePath.isEmpty ? "No certificate selected" : vpn.certificatePath)
+                                        Text(vpn.certificatePath.isEmpty ? "No CA certificate selected" : vpn.certificatePath)
                                             .font(.caption)
                                             .foregroundColor(.secondary)
                                             .lineLimit(1)

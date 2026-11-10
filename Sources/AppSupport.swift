@@ -35,16 +35,6 @@ enum AppNotifications {
 
 // MARK: - Profiles
 
-struct VPNProfile: Codable, Identifiable, Hashable {
-    var id: UUID
-    var name: String
-    var server: String
-    var username: String
-    var ignoreCertificate: Bool
-    var certificatePath: String
-    var fullTunnel: Bool
-}
-
 final class VPNProfileStore: ObservableObject {
     @Published var profiles: [VPNProfile] = []
     @Published var selectedID: String = ""
@@ -77,6 +67,7 @@ final class VPNProfileStore: ObservableObject {
               let profile = profiles.first(where: { $0.id == id }) else { return }
 
         vpn.server = profile.server
+        vpn.port = profile.effectivePort
         vpn.username = profile.username
         vpn.ignoreCertificate = profile.ignoreCertificate
         vpn.certificatePath = profile.certificatePath
@@ -86,6 +77,7 @@ final class VPNProfileStore: ObservableObject {
 
         let defaults = UserDefaults.standard
         defaults.set(profile.server, forKey: "server")
+        defaults.set(profile.effectivePort, forKey: "port")
         defaults.set(profile.username, forKey: "username")
         defaults.set(profile.ignoreCertificate, forKey: "ignoreCertificate")
         defaults.set(profile.certificatePath, forKey: "certificatePath")
@@ -94,6 +86,16 @@ final class VPNProfileStore: ObservableObject {
     }
 
     func saveCurrent(from vpn: VPNModel) {
+        let endpoint: VPNEndpoint
+        do {
+            endpoint = try vpn.endpoint()
+        } catch {
+            vpn.status = .error
+            vpn.message = error.localizedDescription
+            return
+        }
+        vpn.server = endpoint.host
+        vpn.port = String(endpoint.port)
         let trimmed = draftName.trimmingCharacters(in: .whitespacesAndNewlines)
         let name = trimmed.isEmpty ? (vpn.server.isEmpty ? "VPN Profile" : vpn.server) : trimmed
 
@@ -106,7 +108,8 @@ final class VPNProfileStore: ObservableObject {
                 username: vpn.username,
                 ignoreCertificate: vpn.ignoreCertificate,
                 certificatePath: vpn.certificatePath,
-                fullTunnel: vpn.fullTunnel
+                fullTunnel: vpn.fullTunnel,
+                port: String(endpoint.port)
             )
         } else {
             let profile = VPNProfile(
@@ -116,7 +119,8 @@ final class VPNProfileStore: ObservableObject {
                 username: vpn.username,
                 ignoreCertificate: vpn.ignoreCertificate,
                 certificatePath: vpn.certificatePath,
-                fullTunnel: vpn.fullTunnel
+                fullTunnel: vpn.fullTunnel,
+                port: String(endpoint.port)
             )
             profiles.append(profile)
             selectedID = profile.id.uuidString
@@ -171,7 +175,7 @@ struct ProfilesPanel: View {
                         .disabled(store.selectedID.isEmpty)
                 }
 
-                Text("Server, login, certificate mode and tunnel mode are stored in the profile. Passwords stay in macOS Keychain.")
+                Text("Server, port, login, certificate mode and tunnel mode are stored in the profile. Passwords stay in macOS Keychain.")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -497,7 +501,8 @@ final class QuickHealthModel: ObservableObject {
         guard !running else { return }
         running = true
 
-        let server = vpn.server.trimmingCharacters(in: .whitespacesAndNewlines)
+        let serverIsSet = !vpn.server.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let endpoint = Result { try vpn.endpoint() }
         let ready = vpn.ready
         let state = vpn.status
         let fullTunnel = vpn.fullTunnel
@@ -554,14 +559,19 @@ final class QuickHealthModel: ObservableObject {
                 warning: !dnsOK
             ))
 
-            if !server.isEmpty {
-                let serverStatus = self.run("/usr/bin/nc", ["-z", "-G", "3", server, "443"]).1
-                result.append(HealthItem(
-                    title: "SSTP server",
-                    detail: serverStatus == 0 ? "\(server):443 reachable" : "\(server):443 is not reachable",
-                    ok: serverStatus == 0,
-                    warning: serverStatus != 0
-                ))
+            if serverIsSet {
+                switch endpoint {
+                case .success(let server):
+                    let serverStatus = self.run("/usr/bin/nc", ["-z", "-G", "3", server.host, String(server.port)]).1
+                    result.append(HealthItem(
+                        title: "SSTP server",
+                        detail: serverStatus == 0 ? "\(server.target) reachable" : "\(server.target) is not reachable",
+                        ok: serverStatus == 0,
+                        warning: serverStatus != 0
+                    ))
+                case .failure(let error):
+                    result.append(HealthItem(title: "SSTP server", detail: error.localizedDescription, ok: false, warning: true))
+                }
             }
 
             result.append(HealthItem(

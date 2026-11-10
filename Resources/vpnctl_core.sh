@@ -6,9 +6,10 @@ ACTION="${1:-}"
 SERVER="${2:-}"
 USER_NAME="${3:-}"
 SECRET_FILE="${4:-}"
-CERT_MODE="${5:-ignore}"
+CERT_MODE="${5:-verify}"
 CERT_FILE="${6:-}"
 FULL_TUNNEL="${7:-1}"
+PORT="${8-443}"
 
 LOG="/tmp/sstp-gui.log"
 PIDFILE="/tmp/sstp-gui.pid"
@@ -31,6 +32,19 @@ write_result() {
   printf '%s\n' "$1" > "$RESULT"
   chmod 0644 "$RESULT" 2>/dev/null || true
 }
+
+# Invalid input should not tear down an already connected session.
+reject_connect() {
+  [ -z "$SECRET_FILE" ] || /bin/rm -f "$SECRET_FILE"
+  write_result "FAIL|$1"
+  exit 0
+}
+
+CONFIG_HELPERS="$(cd "$(dirname "$0")" && pwd)/vpnctl_config.sh"
+if [ ! -f "$CONFIG_HELPERS" ]; then
+  reject_connect "vpnctl_config.sh is missing from the app bundle"
+fi
+. "$CONFIG_HELPERS"
 
 read_state() {
   STATE_PPP=""
@@ -345,6 +359,15 @@ case "$ACTION" in
     ;;
 
   purge)
+    if [ -n "$SERVER" ]; then
+      if parse_server_endpoint "$SERVER" "$PORT"; then
+        SERVER="$SERVER_HOST"
+      else
+        # Emergency cleanup must still work if the editable profile is invalid.
+        # The cleaner accepts an empty host and still repairs owned VPN state.
+        SERVER=""
+      fi
+    fi
     CLEANER="$(cd "$(dirname "$0")" && pwd)/emergency_cleanup.sh"
     if [ -f "$CLEANER" ]; then
       /bin/bash "$CLEANER" "$SERVER"
@@ -361,16 +384,13 @@ case "$ACTION" in
     ;;
 
   connect)
-    [ -n "$SERVER" ] || fail "Server is empty"
-    [ -n "$USER_NAME" ] || fail "Username is empty"
-    [ -n "$SSTPC" ] || fail "sstpc was not found"
-    [ -f "$SECRET_FILE" ] || fail "Password handoff file was not found"
-    PASSWORD="$(cat "$SECRET_FILE")"
+    parse_server_endpoint "$SERVER" "$PORT" || reject_connect "$CONFIG_ERROR"
+    [ -n "$USER_NAME" ] || reject_connect "Username is empty"
+    [ -n "$SSTPC" ] || reject_connect "sstpc was not found"
+    resolve_certificate "$CERT_MODE" "$CERT_FILE" || reject_connect "$CONFIG_ERROR"
+    CERT_FILE="$RESOLVED_CERT_FILE"
+    read_sstpc_password "$SECRET_FILE" || reject_connect "$CONFIG_ERROR"
     /bin/rm -f "$SECRET_FILE"
-    [ -n "$PASSWORD" ] || fail "Password is empty"
-    if [ "$CERT_MODE" = "verify" ] && [ ! -f "$CERT_FILE" ]; then
-      fail "Certificate file was not found"
-    fi
 
     cleanup_all
     kill_orphan_sstp_helpers
@@ -389,12 +409,12 @@ case "$ACTION" in
     GW="$(/sbin/route -n get default 2>/dev/null | /usr/bin/awk '/gateway:/{print $2; exit}')"
     PHY="$(/sbin/route -n get default 2>/dev/null | /usr/bin/awk '/interface:/{print $2; exit}')"
     [ -n "$GW" ] && [ -n "$PHY" ] || fail "Physical default gateway was not found"
-    /sbin/route -n delete -host "$SERVER" >/dev/null 2>&1 || true
-    /sbin/route -n add -host "$SERVER" "$GW" >/dev/null 2>&1 || fail "Could not pin VPN server route"
-    SERVER_IF="$(/sbin/route -n get "$SERVER" 2>/dev/null | /usr/bin/awk '/interface:/{print $2; exit}')"
+    /sbin/route -n delete -host "$SERVER_HOST" >/dev/null 2>&1 || true
+    /sbin/route -n add -host "$SERVER_HOST" "$GW" >/dev/null 2>&1 || fail "Could not pin VPN server route"
+    SERVER_IF="$(/sbin/route -n get "$SERVER_HOST" 2>/dev/null | /usr/bin/awk '/interface:/{print $2; exit}')"
     [ "$SERVER_IF" = "$PHY" ] || fail "VPN server route points to unexpected interface $SERVER_IF"
 
-    printf '|%s|%s|%s\n' "$PHY" "$GW" "$SERVER" > "$STATEFILE"
+    printf '|%s|%s|%s\n' "$PHY" "$GW" "$SERVER_HOST" > "$STATEFILE"
     chmod 0644 "$STATEFILE" 2>/dev/null || true
 
     PPP_BEFORE="$(list_ppp)"
@@ -408,11 +428,11 @@ case "$ACTION" in
 
     if [ "$CERT_MODE" = "verify" ]; then
       "$SSTPC" --log-stderr --log-level 4 --ca-cert "$CERT_FILE" \
-        --user "$USER_NAME" --password "$PASSWORD" "$SERVER" \
+        --user "$USER_NAME" --password "$PASSWORD" "$SSTP_TARGET" \
         usepeerdns require-mschap-v2 noauth >"$LOG" 2>&1 </dev/null &
     else
       "$SSTPC" --log-stderr --log-level 4 --cert-warn \
-        --user "$USER_NAME" --password "$PASSWORD" "$SERVER" \
+        --user "$USER_NAME" --password "$PASSWORD" "$SSTP_TARGET" \
         usepeerdns require-mschap-v2 noauth >"$LOG" 2>&1 </dev/null &
     fi
 
@@ -440,7 +460,7 @@ case "$ACTION" in
 
     capture_session_helpers "$HELPER_PIDS_BEFORE" "$HELPER_FILES_BEFORE"
     [ -n "$PPP" ] || fail "SSTP connected, but no new PPP interface appeared"
-    printf '%s|%s|%s|%s\n' "$PPP" "$PHY" "$GW" "$SERVER" > "$STATEFILE"
+    printf '%s|%s|%s|%s\n' "$PPP" "$PHY" "$GW" "$SERVER_HOST" > "$STATEFILE"
     chmod 0644 "$STATEFILE" 2>/dev/null || true
 
     if ! probe_via_ppp "$PPP"; then
@@ -451,7 +471,7 @@ case "$ACTION" in
       /sbin/route -n add -net 128.0.0.0/1 -interface "$PPP" >/dev/null 2>&1 || fail "Could not add 128.0.0.0/1"
       INTERNET_IF="$(/sbin/route -n get 1.1.1.1 2>/dev/null | /usr/bin/awk '/interface:/{print $2; exit}')"
       [ "$INTERNET_IF" = "$PPP" ] || fail "Full tunnel did not become active"
-      SERVER_IF="$(/sbin/route -n get "$SERVER" 2>/dev/null | /usr/bin/awk '/interface:/{print $2; exit}')"
+      SERVER_IF="$(/sbin/route -n get "$SERVER_HOST" 2>/dev/null | /usr/bin/awk '/interface:/{print $2; exit}')"
       [ "$SERVER_IF" != "$PPP" ] || fail "VPN server was routed into its own tunnel"
       if ! /usr/bin/nc -z -G 5 1.1.1.1 443 >/dev/null 2>&1; then
         fail "Internet is unavailable after enabling full tunnel"
@@ -460,7 +480,7 @@ case "$ACTION" in
 
     write_result "OK|$PPP|$PHY|$GW"
     /bin/rm -f "$STOPFILE"
-    /bin/bash "$0" watchdog "$SERVER" >"$WATCHDOG_LOG" 2>&1 </dev/null &
+    /bin/bash "$0" watchdog "$SERVER_HOST" >"$WATCHDOG_LOG" 2>&1 </dev/null &
     WD_PID=$!
     printf '%s\n' "$WD_PID" > "$WATCHDOG_PIDFILE"
     chmod 0644 "$WATCHDOG_PIDFILE" "$WATCHDOG_LOG" 2>/dev/null || true
