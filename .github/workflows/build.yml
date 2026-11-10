@@ -21,10 +21,27 @@ jobs:
       - name: Build patched SSTP formula from this checkout
         run: |
           brew tap --custom-remote tolabzik/sstp-client-gui "$GITHUB_WORKSPACE"
-          brew install tolabzik/sstp-client-gui/sstp-client-gui
+          brew install --build-bottle tolabzik/sstp-client-gui/sstp-client-gui
           brew test tolabzik/sstp-client-gui/sstp-client-gui
       - name: Test password serialization and TLS peer verification
         run: bash Tests/upstream.sh
+      - name: Package tested SSTP component
+        shell: bash
+        run: |
+          test "$(uname -m)" = arm64
+          mkdir -p bottle
+          cd bottle
+          brew bottle --json --no-rebuild tolabzik/sstp-client-gui/sstp-client-gui
+          shasum -a 256 *.bottle.tar.gz > SHA256SUMS
+      - name: Upload SSTP component bottle
+        uses: actions/upload-artifact@v4
+        with:
+          name: sstp-client-gui-bottle-arm64
+          path: |
+            bottle/*.bottle.tar.gz
+            bottle/*.json
+            bottle/SHA256SUMS
+          if-no-files-found: error
 
   build:
     needs: dependency
